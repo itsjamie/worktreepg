@@ -1,0 +1,40 @@
+[package]
+name = "worktreepg"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+description = "Fork a Postgres database per git worktree, driven by a comment in .worktreeinclude"
+repository = "https://github.com/itsjamie/worktreepg"
+homepage = "https://github.com/itsjamie/worktreepg"
+readme = "README.md"
+keywords = ["git", "worktree", "postgres", "postgresql"]
+categories = ["command-line-utilities", "development-tools"]
+
+# Named the way git looks for subcommands, so it is run as `git worktreepg ...`.
+[[bin]]
+name = "git-worktreepg"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive", "wrap_help"] }
+libc = "0.2"
+postgres = "0.19"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

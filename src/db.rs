@@ -1,0 +1,499 @@
+//! Administration of one Postgres cluster: how forks and templates are named, created,
+//! tagged, found again, and dropped.
+//!
+//! Every database worktreepg creates carries a `COMMENT ON DATABASE` of the form
+//! `worktreepg {json}` (see [`Meta`]). That comment is the only record of ownership, so
+//! nothing is ever dropped unless it carries one for the repository at hand.
+//!
+//! Statements run over a connection to a maintenance database (`postgres`, then `template1`)
+//! using the credentials from the env file. The development database itself is never held
+//! open here, so it stays usable as a `TEMPLATE`.
+
+use crate::errors::{conflict, environment};
+use crate::pgurl::PgUrl;
+use crate::storage::{self, Sharing};
+use anyhow::{Context, Result};
+use postgres::config::SslMode;
+use postgres::error::SqlState;
+use postgres::{Client, NoTls};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+pub const META_PREFIX: &str = "worktreepg ";
+/// Postgres NAMEDATALEN is 64, so identifiers are at most 63 bytes.
+const MAX_IDENTIFIER: usize = 63;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Meta {
+    #[serde(rename_all = "camelCase")]
+    Fork {
+        v: u8,
+        /// Canonical common `.git` directory of the repository.
+        repo: PathBuf,
+        /// The live development database everything descends from.
+        source: String,
+        /// What the fork was copied from: the template if one existed, else `source`.
+        template: String,
+        worktree: PathBuf,
+        branch: Option<String>,
+        created_at: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Template { v: u8, repo: PathBuf, source: String, created_at: String },
+}
+
+impl Meta {
+    pub fn repo(&self) -> &Path {
+        match self {
+            Meta::Fork { repo, .. } | Meta::Template { repo, .. } => repo,
+        }
+    }
+
+    pub fn source(&self) -> &str {
+        match self {
+            Meta::Fork { source, .. } | Meta::Template { source, .. } => source,
+        }
+    }
+
+    pub fn created_at(&self) -> &str {
+        match self {
+            Meta::Fork { created_at, .. } | Meta::Template { created_at, .. } => created_at,
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        format!("{META_PREFIX}{}", serde_json::to_string(self).expect("meta serializes"))
+    }
+
+    /// `None` for comments that are not ours, including a future format version.
+    pub fn decode(comment: &str) -> Option<Self> {
+        let json = comment.strip_prefix(META_PREFIX)?;
+        let meta: Meta = serde_json::from_str(json).ok()?;
+        match meta {
+            Meta::Fork { v: 1, .. } | Meta::Template { v: 1, .. } => Some(meta),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Managed {
+    pub name: String,
+    pub meta: Meta,
+}
+
+/// `<source>_<worktree name>`, lowercased with anything outside `[a-z0-9]` turned into `_`, so
+/// the name never needs quoting in psql. The full branch name is used rather than its last
+/// segment so `feature/auth` and `bugfix/auth` do not share a database.
+pub fn fork_name(source: &str, worktree_name: &str) -> Result<String> {
+    let mut suffix = String::new();
+    let mut pending_sep = false;
+    for ch in worktree_name.to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_sep && !suffix.is_empty() {
+                suffix.push('_');
+            }
+            pending_sep = false;
+            suffix.push(ch);
+        } else {
+            pending_sep = true;
+        }
+    }
+    if suffix.is_empty() {
+        anyhow::bail!("worktree name \"{worktree_name}\" leaves nothing usable in a database name");
+    }
+    Ok(truncate_identifier(format!("{source}_{suffix}")))
+}
+
+/// `<source>_template`: the snapshot forks are cloned from.
+pub fn template_name(source: &str) -> String {
+    truncate_identifier(format!("{source}_template"))
+}
+
+fn truncate_identifier(mut name: String) -> String {
+    while name.len() > MAX_IDENTIFIER {
+        name.pop();
+    }
+    name.trim_end_matches('_').to_string()
+}
+
+pub struct ForkSpec {
+    pub source: String,
+    pub name: String,
+    pub repo: PathBuf,
+    pub worktree: PathBuf,
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ForkOptions {
+    /// Drop and re-clone a fork that already exists.
+    pub recreate: bool,
+    /// Close connections to the live database when it has to serve as the template.
+    pub terminate: bool,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkStatus {
+    Created { from: String, copy: CopyMethod },
+    Planned { from: String, copy: CopyMethod },
+    Exists,
+}
+
+/// How `CREATE DATABASE ... TEMPLATE` copies the template's files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyMethod {
+    /// Block-by-block through the write-ahead log: Postgres's default, and all that is
+    /// available before Postgres 18.
+    WalLog,
+    /// `STRATEGY = FILE_COPY` with `file_copy_method = clone`: the kernel copies whole files and,
+    /// on a copy-on-write filesystem, shares their blocks with the template.
+    Clone,
+}
+
+impl CopyMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CopyMethod::WalLog => "wal_log",
+            CopyMethod::Clone => "clone",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TemplateOptions {
+    /// Replace an existing template (refresh) rather than leaving it alone (create).
+    pub replace: bool,
+    /// Take over a database of the template's name that worktreepg did not create.
+    pub force: bool,
+    pub terminate: bool,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateStatus {
+    Created,
+    Replaced,
+    Exists,
+    Dropped,
+    Missing,
+}
+
+pub struct Admin {
+    client: Client,
+    copy: CopyMethod,
+    /// Whether the server runs on this host, so its data directory can be inspected.
+    local: bool,
+}
+
+impl Admin {
+    pub fn connect(url: &PgUrl) -> Result<Self> {
+        let mut config = postgres::Config::from_str(&url.raw).map_err(|e| environment(format!("{}: {e}", url.server())))?;
+        // TLS is not negotiated: this tool targets local development clusters.
+        config.ssl_mode(SslMode::Disable);
+        let mut errors = Vec::new();
+        for maintenance_db in ["postgres", "template1"] {
+            config.dbname(maintenance_db);
+            match config.connect(NoTls) {
+                Ok(mut client) => {
+                    let copy = enable_clone(&mut client)?;
+                    return Ok(Self { client, copy, local: url.is_local() });
+                }
+                Err(e) => {
+                    let missing = e.code() == Some(&SqlState::INVALID_CATALOG_NAME);
+                    errors.push(format!("{maintenance_db}: {e}"));
+                    if !missing {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(environment(format!("cannot connect to {} (tried {})", url.server(), errors.join("; "))))
+    }
+
+    pub fn copy_method(&self) -> CopyMethod {
+        self.copy
+    }
+
+    /// One line describing what the copy method will do to disk usage, for `--verbose`.
+    pub fn storage_note(&mut self) -> Result<String> {
+        if self.copy == CopyMethod::WalLog {
+            return Ok("copy method: wal_log (file cloning needs Postgres 18); forks take as much space as the template".into());
+        }
+        let data_directory: String = self.client.query_one("SHOW data_directory", &[])?.get(0);
+        let path = Path::new(&data_directory);
+        let fs = if self.local { storage::filesystem(path) } else { None };
+        Ok(match fs {
+            Some(fs) => match fs.sharing {
+                Sharing::Shared => format!("copy method: clone; {data_directory} is on {}, forks share blocks with the template", fs.name),
+                Sharing::Depends => format!(
+                    "copy method: clone; {data_directory} is on {}, forks share blocks with the template if the filesystem was created with reflink/block cloning enabled",
+                    fs.name
+                ),
+                Sharing::Copied => format!("copy method: clone; {data_directory} is on {}, which cannot share blocks, so forks are full copies", fs.name),
+            },
+            None => format!(
+                "copy method: clone; {data_directory} is not visible from this host (a container or another machine), so whether forks share blocks depends on its filesystem"
+            ),
+        })
+    }
+
+    pub fn exists(&mut self, name: &str) -> Result<bool> {
+        let row = self.client.query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&name])?;
+        Ok(row.is_some())
+    }
+
+    /// Metadata of a database, or `None` when it does not exist or was not created by worktreepg.
+    pub fn meta(&mut self, name: &str) -> Result<Option<Meta>> {
+        let row = self.client.query_opt(
+            "SELECT s.description FROM pg_database d JOIN pg_shdescription s ON s.objoid = d.oid AND s.classoid = 'pg_database'::regclass WHERE d.datname = $1",
+            &[&name],
+        )?;
+        Ok(row.and_then(|r| Meta::decode(r.get::<_, String>(0).as_str())))
+    }
+
+    /// Every database on the cluster that carries worktreepg metadata.
+    pub fn list_managed(&mut self) -> Result<Vec<Managed>> {
+        let rows = self.client.query(
+            "SELECT d.datname, s.description FROM pg_database d JOIN pg_shdescription s ON s.objoid = d.oid AND s.classoid = 'pg_database'::regclass WHERE s.description LIKE $1 ORDER BY d.datname",
+            &[&format!("{META_PREFIX}%")],
+        )?;
+        Ok(rows.iter().filter_map(|r| Meta::decode(r.get::<_, String>(1).as_str()).map(|meta| Managed { name: r.get(0), meta })).collect())
+    }
+
+    pub fn forks_for(&mut self, repo: &Path) -> Result<Vec<Managed>> {
+        Ok(self.list_managed()?.into_iter().filter(|m| matches!(m.meta, Meta::Fork { .. }) && m.meta.repo() == repo).collect())
+    }
+
+    /// Makes sure `spec.name` exists as a fork of `spec.source`, cloned from the template when
+    /// there is one. Re-running is a no-op. A database of that name that worktreepg did not
+    /// create for this repository is a conflict, with or without `recreate`.
+    pub fn ensure_fork(&mut self, spec: &ForkSpec, opts: ForkOptions) -> Result<ForkStatus> {
+        if self.exists(&spec.name)? {
+            match self.meta(&spec.name)? {
+                Some(Meta::Template { .. }) => {
+                    return Err(conflict(format!("\"{}\" is a worktreepg template database, not a fork", spec.name)))
+                }
+                Some(Meta::Fork { ref repo, .. }) if repo == &spec.repo => {}
+                _ => return Err(conflict("database already exists and was not created by worktreepg for this repository")),
+            }
+            if !opts.recreate {
+                return Ok(ForkStatus::Exists);
+            }
+            if !opts.dry_run {
+                self.drop_database(&spec.name)?;
+            }
+        }
+
+        let template = template_name(&spec.source);
+        let from = if self.exists(&template)? { template } else { spec.source.clone() };
+        let copy = self.copy;
+        if opts.dry_run {
+            return Ok(ForkStatus::Planned { from, copy });
+        }
+        self.create_from(&spec.name, &from, opts.terminate && from == spec.source)?;
+        self.set_meta(
+            &spec.name,
+            &Meta::Fork {
+                v: 1,
+                repo: spec.repo.clone(),
+                source: spec.source.clone(),
+                template: from.clone(),
+                worktree: spec.worktree.clone(),
+                branch: spec.branch.clone(),
+                created_at: now(),
+            },
+        )?;
+        Ok(ForkStatus::Created { from, copy })
+    }
+
+    /// Snapshots `source` into its template database. The template is flagged `IS_TEMPLATE`, so
+    /// any role with `CREATEDB` can clone it and a plain `DROP DATABASE` refuses, and
+    /// `ALLOW_CONNECTIONS false`, so it can never be in use when a fork is being made.
+    pub fn snapshot_template(&mut self, source: &str, repo: &Path, opts: TemplateOptions) -> Result<TemplateStatus> {
+        let name = template_name(source);
+        let exists = self.check_template_ownership(&name, opts.force)?;
+        if exists && !opts.replace {
+            return Ok(TemplateStatus::Exists);
+        }
+        if opts.dry_run {
+            return Ok(if exists { TemplateStatus::Replaced } else { TemplateStatus::Created });
+        }
+        if exists {
+            self.drop_database(&name)?;
+        }
+        self.create_from(&name, source, opts.terminate)?;
+        self.set_meta(&name, &Meta::Template { v: 1, repo: repo.to_path_buf(), source: source.to_string(), created_at: now() })?;
+        self.client.batch_execute(&format!("ALTER DATABASE {} WITH IS_TEMPLATE true ALLOW_CONNECTIONS false", ident(&name)))?;
+        Ok(if exists { TemplateStatus::Replaced } else { TemplateStatus::Created })
+    }
+
+    pub fn drop_template(&mut self, source: &str, opts: TemplateOptions) -> Result<TemplateStatus> {
+        let name = template_name(source);
+        if !self.check_template_ownership(&name, opts.force)? {
+            return Ok(TemplateStatus::Missing);
+        }
+        if !opts.dry_run {
+            self.drop_database(&name)?;
+        }
+        Ok(TemplateStatus::Dropped)
+    }
+
+    /// Drops a fork. Callers pass names from [`Admin::forks_for`], so ownership is already known.
+    pub fn drop_fork(&mut self, name: &str, dry_run: bool) -> Result<()> {
+        if !dry_run {
+            self.drop_database(name)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the template exists; an existing database of that name that is not our template
+    /// is a conflict unless `force`.
+    fn check_template_ownership(&mut self, name: &str, force: bool) -> Result<bool> {
+        if !self.exists(name)? {
+            return Ok(false);
+        }
+        match self.meta(name)? {
+            Some(Meta::Template { .. }) => Ok(true),
+            _ if force => Ok(true),
+            _ => Err(conflict(format!("{name} exists but was not created by worktreepg (use --force to take it over)"))),
+        }
+    }
+
+    fn create_from(&mut self, name: &str, template: &str, terminate: bool) -> Result<()> {
+        if terminate {
+            self.client.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+                &[&template],
+            )?;
+        }
+        let strategy = match self.copy {
+            CopyMethod::WalLog => "",
+            CopyMethod::Clone => " STRATEGY = FILE_COPY",
+        };
+        let sql = format!("CREATE DATABASE {} TEMPLATE {}{strategy}", ident(name), ident(template));
+        match self.client.batch_execute(&sql) {
+            Ok(()) => Ok(()),
+            Err(e) if e.code() == Some(&SqlState::OBJECT_IN_USE) => {
+                let n: i64 = self
+                    .client
+                    .query_one("SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", &[&template])?
+                    .get(0);
+                Err(environment(format!(
+                    "database \"{template}\" has {n} open connection{}, so Postgres will not copy it. Stop the app using it, or re-run with --terminate to close those connections.",
+                    if n == 1 { "" } else { "s" }
+                )))
+            }
+            Err(e) => Err(e).with_context(|| format!("creating database {name}")),
+        }
+    }
+
+    fn set_meta(&mut self, name: &str, meta: &Meta) -> Result<()> {
+        self.client.batch_execute(&format!("COMMENT ON DATABASE {} IS {}", ident(name), literal(&meta.encode())))?;
+        Ok(())
+    }
+
+    /// `DROP DATABASE ... WITH (FORCE)`, clearing the template flag first when needed.
+    fn drop_database(&mut self, name: &str) -> Result<()> {
+        let is_template: bool =
+            self.client.query_opt("SELECT datistemplate FROM pg_database WHERE datname = $1", &[&name])?.is_some_and(|r| r.get(0));
+        if is_template {
+            self.client.batch_execute(&format!("ALTER DATABASE {} WITH IS_TEMPLATE false ALLOW_CONNECTIONS true", ident(name)))?;
+        }
+        self.client.batch_execute(&format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", ident(name)))?;
+        Ok(())
+    }
+}
+
+/// One connection per cluster, shared by every variable that points at it.
+#[derive(Default)]
+pub struct Pool {
+    admins: HashMap<String, Admin>,
+}
+
+impl Pool {
+    pub fn get(&mut self, url: &PgUrl) -> Result<&mut Admin> {
+        if !self.admins.contains_key(&url.server_key) {
+            self.admins.insert(url.server_key.clone(), Admin::connect(url)?);
+        }
+        Ok(self.admins.get_mut(&url.server_key).expect("inserted above"))
+    }
+}
+
+/// Turns on file cloning for the session when the server offers it (Postgres 18+). The
+/// setting must be issued on its own: bundling it with `CREATE DATABASE` in one simple-query
+/// string would wrap both in a transaction, which `CREATE DATABASE` refuses.
+fn enable_clone(client: &mut Client) -> Result<CopyMethod> {
+    let row = client.query_opt("SELECT enumvals FROM pg_settings WHERE name = 'file_copy_method'", &[])?;
+    let supported = row.is_some_and(|r| r.get::<_, Vec<String>>(0).iter().any(|v| v == "clone"));
+    if !supported {
+        return Ok(CopyMethod::WalLog);
+    }
+    client.batch_execute("SET file_copy_method = clone")?;
+    Ok(CopyMethod::Clone)
+}
+
+fn ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fork_names_use_the_full_branch() {
+        assert_eq!(fork_name("app", "feature/Auth-v2").unwrap(), "app_feature_auth_v2");
+        assert_eq!(fork_name("app", "bugfix/auth").unwrap(), "app_bugfix_auth");
+        assert_eq!(fork_name("app", "--weird--").unwrap(), "app_weird");
+        assert!(fork_name("app", "///").is_err());
+    }
+
+    #[test]
+    fn names_fit_in_63_bytes() {
+        assert_eq!(fork_name("app", &"x".repeat(100)).unwrap().len(), 63);
+        assert_eq!(template_name("app"), "app_template");
+    }
+
+    #[test]
+    fn meta_round_trips_through_a_comment() {
+        let meta = Meta::Fork {
+            v: 1,
+            repo: "/r/.git".into(),
+            source: "app".into(),
+            template: "app_template".into(),
+            worktree: "/r-wt".into(),
+            branch: Some("x".into()),
+            created_at: "2026-08-22T00:00:00.000Z".into(),
+        };
+        let comment = meta.encode();
+        assert!(comment.starts_with("worktreepg {\"kind\":\"fork\""));
+        assert!(comment.contains("\"createdAt\""));
+        assert_eq!(Meta::decode(&comment), Some(meta));
+    }
+
+    #[test]
+    fn meta_ignores_foreign_comments() {
+        assert_eq!(Meta::decode("production database"), None);
+        assert_eq!(Meta::decode("worktreepg not json"), None);
+        assert_eq!(Meta::decode("worktreepg {\"kind\":\"fork\",\"v\":2,\"repo\":\"/\",\"source\":\"a\",\"template\":\"a\",\"worktree\":\"/\",\"branch\":null,\"createdAt\":\"\"}"), None);
+    }
+
+    #[test]
+    fn quoting() {
+        assert_eq!(ident("a\"b"), "\"a\"\"b\"");
+        assert_eq!(literal("it's"), "'it''s'");
+    }
+}
