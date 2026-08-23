@@ -35,7 +35,7 @@ pub enum Meta {
         repo: PathBuf,
         /// The live development database everything descends from.
         source: String,
-        /// What the fork was copied from: the template if one existed, else `source`.
+        /// What the fork was copied from: `source` when nothing was connected to it, else the template.
         template: String,
         worktree: PathBuf,
         branch: Option<String>,
@@ -132,16 +132,30 @@ pub struct ForkSpec {
 pub struct ForkOptions {
     /// Drop and re-clone a fork that already exists.
     pub recreate: bool,
-    /// Close connections to the live database when it has to serve as the template.
+    /// Close connections to the live database so it can be cloned while the app is running,
+    /// instead of falling back to the template.
     pub terminate: bool,
     pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForkStatus {
-    Created { from: String, copy: CopyMethod },
-    Planned { from: String, copy: CopyMethod },
+    /// The fork was cloned, or in a dry run would be.
+    Forked {
+        from: String,
+        copy: CopyMethod,
+        origin: Origin,
+    },
     Exists,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// Nothing was connected to the live database, so the fork is a copy of it as of now. When a
+    /// template exists it was replaced with a copy of the fork, so it is just as current.
+    Live { template_refreshed: bool },
+    /// The live database was in use, so the fork is a copy of the template, taken at `created_at`.
+    Template { connections: i64, created_at: String },
 }
 
 /// How `CREATE DATABASE ... TEMPLATE` copies the template's files.
@@ -188,6 +202,24 @@ pub struct Admin {
     copy: CopyMethod,
     /// Whether the server runs on this host, so its data directory can be inspected.
     local: bool,
+}
+
+struct ExistingTemplate {
+    name: String,
+    created_at: String,
+}
+
+enum CopyOutcome {
+    Copied,
+    /// The template had this many other backends connected, so Postgres refused.
+    InUse(i64),
+}
+
+fn in_use(database: &str, connections: i64) -> anyhow::Error {
+    environment(format!(
+        "database \"{database}\" has {connections} open connection{}, so Postgres will not copy it. Stop the app using it, or re-run with --terminate to close those connections.",
+        if connections == 1 { "" } else { "s" }
+    ))
 }
 
 impl Admin {
@@ -269,9 +301,12 @@ impl Admin {
         Ok(self.list_managed()?.into_iter().filter(|m| matches!(m.meta, Meta::Fork { .. }) && m.meta.repo() == repo).collect())
     }
 
-    /// Makes sure `spec.name` exists as a fork of `spec.source`, cloned from the template when
-    /// there is one. Re-running is a no-op. A database of that name that worktreepg did not
-    /// create for this repository is a conflict, with or without `recreate`.
+    /// Makes sure `spec.name` exists as a fork of `spec.source`. The fork is cloned from the live
+    /// database when nothing else is connected to it, and from the template otherwise, because
+    /// Postgres refuses to copy a database that is in use. A fork cloned from the live database
+    /// also replaces the template, when there is one, with a copy of itself, so the fallback is
+    /// as current as the last fork. Re-running is a no-op. A database of that name that
+    /// worktreepg did not create for this repository is a conflict, with or without `recreate`.
     pub fn ensure_fork(&mut self, spec: &ForkSpec, opts: ForkOptions) -> Result<ForkStatus> {
         if self.exists(&spec.name)? {
             match self.meta(&spec.name)? {
@@ -289,13 +324,33 @@ impl Admin {
             }
         }
 
-        let template = template_name(&spec.source);
-        let from = if self.exists(&template)? { template } else { spec.source.clone() };
+        let template = self.template_of(&spec.source)?;
         let copy = self.copy;
+        let fallback = |template: Option<ExistingTemplate>, connections: i64| match template {
+            Some(t) => Ok((t.name, Origin::Template { connections, created_at: t.created_at })),
+            None => Err(in_use(&spec.source, connections)),
+        };
+
         if opts.dry_run {
-            return Ok(ForkStatus::Planned { from, copy });
+            let connections = if opts.terminate { 0 } else { self.connections(&spec.source)? };
+            let (from, origin) = if connections == 0 {
+                (spec.source.clone(), Origin::Live { template_refreshed: template.is_some() })
+            } else {
+                fallback(template, connections)?
+            };
+            return Ok(ForkStatus::Forked { from, copy, origin });
         }
-        self.create_from(&spec.name, &from, opts.terminate && from == spec.source)?;
+
+        let (from, origin) = match self.create_from(&spec.name, &spec.source, opts.terminate)? {
+            CopyOutcome::Copied => (spec.source.clone(), Origin::Live { template_refreshed: template.is_some() }),
+            CopyOutcome::InUse(connections) => {
+                let (from, origin) = fallback(template, connections)?;
+                if let CopyOutcome::InUse(n) = self.create_from(&spec.name, &from, false)? {
+                    return Err(in_use(&from, n));
+                }
+                (from, origin)
+            }
+        };
         self.set_meta(
             &spec.name,
             &Meta::Fork {
@@ -308,7 +363,15 @@ impl Admin {
                 created_at: now(),
             },
         )?;
-        Ok(ForkStatus::Created { from, copy })
+        if let Origin::Live { template_refreshed: true } = origin {
+            // Copied from the fork rather than the live database: the fork has no connections yet,
+            // so this cannot fail the way a second copy of the live database could if the app
+            // reconnected in between.
+            let name = template_name(&spec.source);
+            self.drop_database(&name)?;
+            self.create_template(&name, &spec.name, &spec.source, &spec.repo, false)?;
+        }
+        Ok(ForkStatus::Forked { from, copy, origin })
     }
 
     /// Snapshots `source` into its template database. The template is flagged `IS_TEMPLATE`, so
@@ -324,12 +387,46 @@ impl Admin {
             return Ok(if exists { TemplateStatus::Replaced } else { TemplateStatus::Created });
         }
         if exists {
+            // The old snapshot is only dropped once the live database looks copyable, so a refresh
+            // that runs into a connected app keeps the snapshot it had.
+            if !opts.terminate {
+                let n = self.connections(source)?;
+                if n > 0 {
+                    return Err(in_use(source, n));
+                }
+            }
             self.drop_database(&name)?;
         }
-        self.create_from(&name, source, opts.terminate)?;
-        self.set_meta(&name, &Meta::Template { v: 1, repo: repo.to_path_buf(), source: source.to_string(), created_at: now() })?;
-        self.client.batch_execute(&format!("ALTER DATABASE {} WITH IS_TEMPLATE true ALLOW_CONNECTIONS false", ident(&name)))?;
+        self.create_template(&name, source, source, repo, opts.terminate)?;
         Ok(if exists { TemplateStatus::Replaced } else { TemplateStatus::Created })
+    }
+
+    /// Creates `name` as a copy of `from`, tagged and flagged as the template snapshotted from
+    /// `source`. `from` is `source` itself or a fresh fork of it.
+    fn create_template(&mut self, name: &str, from: &str, source: &str, repo: &Path, terminate: bool) -> Result<()> {
+        if let CopyOutcome::InUse(n) = self.create_from(name, from, terminate)? {
+            return Err(in_use(from, n));
+        }
+        self.set_meta(name, &Meta::Template { v: 1, repo: repo.to_path_buf(), source: source.to_string(), created_at: now() })?;
+        self.client.batch_execute(&format!("ALTER DATABASE {} WITH IS_TEMPLATE true ALLOW_CONNECTIONS false", ident(name)))?;
+        Ok(())
+    }
+
+    /// The template snapshotted from `source`, if worktreepg created one.
+    fn template_of(&mut self, source: &str) -> Result<Option<ExistingTemplate>> {
+        let name = template_name(source);
+        Ok(match self.meta(&name)? {
+            Some(Meta::Template { created_at, .. }) => Some(ExistingTemplate { name, created_at }),
+            _ => None,
+        })
+    }
+
+    /// Backends connected to `database` other than this one.
+    fn connections(&mut self, database: &str) -> Result<i64> {
+        Ok(self
+            .client
+            .query_one("SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", &[&database])?
+            .get(0))
     }
 
     pub fn drop_template(&mut self, source: &str, opts: TemplateOptions) -> Result<TemplateStatus> {
@@ -364,7 +461,9 @@ impl Admin {
         }
     }
 
-    fn create_from(&mut self, name: &str, template: &str, terminate: bool) -> Result<()> {
+    /// `CREATE DATABASE name TEMPLATE template`. Postgres checks for other backends in the
+    /// template before it copies anything, so an in-use outcome has created nothing.
+    fn create_from(&mut self, name: &str, template: &str, terminate: bool) -> Result<CopyOutcome> {
         if terminate {
             self.client.execute(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
@@ -377,17 +476,8 @@ impl Admin {
         };
         let sql = format!("CREATE DATABASE {} TEMPLATE {}{strategy}", ident(name), ident(template));
         match self.client.batch_execute(&sql) {
-            Ok(()) => Ok(()),
-            Err(e) if e.code() == Some(&SqlState::OBJECT_IN_USE) => {
-                let n: i64 = self
-                    .client
-                    .query_one("SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", &[&template])?
-                    .get(0);
-                Err(environment(format!(
-                    "database \"{template}\" has {n} open connection{}, so Postgres will not copy it. Stop the app using it, or re-run with --terminate to close those connections.",
-                    if n == 1 { "" } else { "s" }
-                )))
-            }
+            Ok(()) => Ok(CopyOutcome::Copied),
+            Err(e) if e.code() == Some(&SqlState::OBJECT_IN_USE) => Ok(CopyOutcome::InUse(self.connections(template)?)),
             Err(e) => Err(e).with_context(|| format!("creating database {name}")),
         }
     }

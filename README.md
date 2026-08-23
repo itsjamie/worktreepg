@@ -51,19 +51,13 @@ The first token is the env file, relative to the worktree root. Everything after
 # worktreepg: packages/db/.env DATABASE_URL
 ```
 
-Then take a snapshot of your development database:
+That is enough when your dev server is stopped: `apply` clones the live database as it is at that moment, the way `git worktree add` branches from the current commit. Postgres refuses to copy a database that anything is connected to, though, and dev servers keep connection pools open. For that case, take a snapshot once:
 
 ```sh
 git worktreepg template create
 ```
 
-This creates `<database>_template`, flagged as a template database that nothing can connect to. Forks are cloned from it, so creating a worktree never needs your dev server to be stopped. Refresh it whenever you want new worktrees to start from current data:
-
-```sh
-git worktreepg template refresh
-```
-
-The snapshot is optional. Without one, `apply` clones the live database directly, which only works while nothing is connected to it.
+This creates `<database>_template`, flagged as a template database that nothing can connect to. While the live database is in use, forks are cloned from the snapshot instead, and `apply` says so and how old it is. Whenever a fork does come from the live database, the snapshot is replaced with a copy of that fork, so it is as current as the last worktree you created. `git worktreepg template refresh` replaces it on demand.
 
 ## Workflow
 
@@ -75,6 +69,14 @@ cd ../app-auth && portless
 ```
 
 `apply` creates `app_feature_auth` (for a database named `app`) and rewrites `DATABASE_URL` in `../app-auth/.env` to point at it. Everything else in the URL, and everything else in the file, is left as it was. Running it again is a no-op.
+
+```
+create    app_feature_auth (from app, cloned)
+refresh   app_template (from app, cloned)
+rewrite   .env DATABASE_URL -> app_feature_auth
+```
+
+With the dev server running, the first line reads `from app_template` instead, and a warning on stderr gives the number of open connections and the snapshot's age. `apply --recreate --terminate` closes those connections and clones the live database after all.
 
 The order matters: `git worktreeinclude apply` is what puts `.env` in the new worktree, and worktreepg only edits env files it finds there. If it created the file itself, git-worktreeinclude would later overwrite it (or report a conflict). Running `apply` before the file exists stops with exit code 4 and nothing is created.
 
@@ -104,18 +106,19 @@ git worktreepg template create|refresh|drop [--terminate] [--dry-run] [--force]
 
 All commands accept `--from auto|<path>`, `--include <path>`, `--json`, `--quiet`, and `--verbose`, with the same meaning as in `git-worktreeinclude`. `--json` emits one object on stdout with a `summary` and an `actions` list; file contents and connection strings are never printed.
 
-- `apply --recreate` drops the worktree's fork and clones it again, which is how you pick up a refreshed template.
+- `apply --recreate` drops the worktree's fork and clones it again from current data.
 - `apply --force` rewrites the env variable even when it points at some database other than the source or the fork. Without it that is reported as a conflict (exit code 3), the same way `git worktreeinclude` treats a differing file.
-- `--terminate` closes open connections to the live database before copying it. Postgres refuses to use a database as a template while anyone is connected, and dev servers keep pools open. Nothing is terminated unless you pass the flag; the error tells you how many connections are in the way.
+- `--terminate` closes open connections to the live database before copying it. Postgres refuses to use a database as a template while anyone is connected, and dev servers keep pools open. Nothing is terminated unless you pass the flag. Without it, `apply` falls back to the snapshot, and `template create|refresh` stop with an error that says how many connections are in the way.
 - `remove` runs `git worktree remove` first so git's own checks (uncommitted changes, locks) run before anything is dropped. `--force` is passed through to git. `--keep-worktree` only drops the databases.
 - `list --all` includes databases created for other repositories on the same cluster.
 
 ## How it works
 
 - The fork is named `<database>_<branch>`, with the branch lowercased and anything outside `[a-z0-9]` turned into `_`, so it never needs quoting: `feature/auth` becomes `app_feature_auth`. The full branch name is used rather than the last segment, so `feature/auth` and `bugfix/auth` do not share a database. On a detached HEAD the worktree directory name is used. `--worktree-name` overrides it.
+- `apply` tries `CREATE DATABASE ... TEMPLATE <database>` first. Postgres checks for other backends before it copies anything, so when the live database is in use nothing has been created yet and the fork is cloned from `<database>_template` instead. When the fork did come from the live database and a snapshot exists, the snapshot is dropped and recreated as a copy of the fork rather than of the live database: nothing is connected to the fork yet, so that cannot fail the way a second copy of the live database could if the app reconnected in between.
 - Every database worktreepg creates carries a `COMMENT ON DATABASE` starting with `worktreepg ` followed by JSON: the repository (its common `.git` directory), the worktree path, the branch, and where it was copied from. `remove`, `prune`, and `list` find databases through that comment, so nothing is dropped unless worktreepg created it for this repository. `psql`'s `\l+` shows the comment.
 - On Postgres 18 and newer, forks and templates are made with `STRATEGY = FILE_COPY` and `file_copy_method = clone`, so the kernel copies the files with `copy_file_range()` (`copyfile` on macOS). On a copy-on-write filesystem (btrfs, bcachefs, APFS, XFS with `reflink=1`, ZFS with block cloning) a fork then shares its blocks with the template and costs no disk until it diverges. Measured on btrfs with an 89 MB database: the clone had 0 B of exclusive extents, where `WAL_LOG` and a plain file copy each wrote a full 88 MiB. The price is the two checkpoints `FILE_COPY` forces, about a second, regardless of size. On filesystems that cannot share blocks the kernel does an ordinary copy, so nothing breaks; `--verbose` reports the copy method and, when the server is local and its data directory is visible, the filesystem it sits on. Inside a container the data directory is not visible from the host, so it says so rather than guessing. Before Postgres 18 the default `WAL_LOG` strategy is used.
-- The template is created with `CREATE DATABASE ... TEMPLATE <database>`, then `ALTER DATABASE ... IS_TEMPLATE true ALLOW_CONNECTIONS false`. `IS_TEMPLATE` lets any role with `CREATEDB` clone it and makes a plain `DROP DATABASE` refuse; `ALLOW_CONNECTIONS false` means it can never be "in use" when a fork is being made.
+- The template is created with `CREATE DATABASE ... TEMPLATE <database>`, then `ALTER DATABASE ... IS_TEMPLATE true ALLOW_CONNECTIONS false`. `IS_TEMPLATE` lets any role with `CREATEDB` clone it and makes a plain `DROP DATABASE` refuse; `ALLOW_CONNECTIONS false` means it can never be "in use" when a fork is being made. `template refresh` checks for connections before dropping the old snapshot, so a refresh that runs into a connected app leaves the snapshot it had.
 - Administrative statements run over a connection to `postgres` (falling back to `template1`) using the credentials from the env file, so the development database itself is never held open by worktreepg.
 - Exit codes match `git-worktreeinclude`: `0` success, `1` internal error, `2` usage error, `3` conflict, `4` environment error (not a git repository, cannot connect, database in use, env file not there yet, no directive).
 

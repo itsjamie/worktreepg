@@ -1,7 +1,7 @@
 //! The five commands. Each one works in terms of forks, templates, and worktrees; the SQL,
 //! metadata, and file-format details live in `db`, `envfile`, and `project`.
 
-use crate::db::{self, CopyMethod, ForkOptions, ForkSpec, ForkStatus, Meta, Pool, TemplateOptions, TemplateStatus};
+use crate::db::{self, CopyMethod, ForkOptions, ForkSpec, ForkStatus, Meta, Origin, Pool, TemplateOptions, TemplateStatus};
 use crate::envfile::EnvFile;
 use crate::errors::{environment, is_conflict, usage, EXIT_CONFLICT, EXIT_INTERNAL};
 use crate::git;
@@ -40,6 +40,19 @@ fn status(dry_run: bool) -> &'static str {
     }
 }
 
+/// How long ago an RFC 3339 timestamp was, coarsely: "a moment", "5 minutes", "3 days".
+fn age(timestamp: &str) -> String {
+    let Ok(then) = chrono::DateTime::parse_from_rfc3339(timestamp) else { return timestamp.to_string() };
+    let secs = (chrono::Utc::now() - then.with_timezone(&chrono::Utc)).num_seconds().max(0);
+    let (n, unit) = match secs {
+        0..=59 => return "a moment".to_string(),
+        60..=3599 => (secs / 60, "minute"),
+        3600..=86399 => (secs / 3600, "hour"),
+        _ => (secs / 86400, "day"),
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
 pub struct ApplyOptions {
     pub worktree_name: Option<String>,
     pub recreate: bool,
@@ -58,8 +71,17 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
         Some(name) => name.clone(),
         None => git::worktree_name(&project.target)?,
     };
-    let mut counts =
-        Counts::new(&["matched", "created", "skipped_existing", "rewritten", "skipped_same", "skipped_missing_src", "conflicts", "errors"]);
+    let mut counts = Counts::new(&[
+        "matched",
+        "created",
+        "template_refreshed",
+        "skipped_existing",
+        "rewritten",
+        "skipped_same",
+        "skipped_missing_src",
+        "conflicts",
+        "errors",
+    ]);
     let doc = document(vec![
         ("dry_run", json!(opts.dry_run)),
         ("from", json!(project.source)),
@@ -71,6 +93,7 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
     let finish = |counts: &mut Counts, reporter: &Reporter| -> i32 {
         if opts.dry_run {
             counts.rename("created", "create_planned");
+            counts.rename("template_refreshed", "template_refresh_planned");
             counts.rename("rewritten", "rewrite_planned");
         }
         reporter.finish(doc.clone(), counts);
@@ -147,19 +170,32 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
             reporter.verbose(note);
         }
         match admin.ensure_fork(&spec, fork_opts) {
-            Ok(ForkStatus::Created { from, copy }) => {
+            Ok(ForkStatus::Forked { from, copy, origin }) => {
                 counts.inc("created");
-                reporter.action(
-                    json!({ "op": "create_database", "database": name, "from": from, "copy": copy.as_str(), "status": "done" }),
-                    format!("create    {name} (from {from}, {})", describe_copy(copy)),
-                );
-            }
-            Ok(ForkStatus::Planned { from, copy }) => {
-                counts.inc("created");
-                reporter.action(
-                    json!({ "op": "create_database", "database": name, "from": from, "copy": copy.as_str(), "status": "planned" }),
-                    format!("create    {name} (from {from}, {}, planned)", describe_copy(copy)),
-                );
+                let st = status(opts.dry_run);
+                let mut action = json!({ "op": "create_database", "database": name, "from": from, "copy": copy.as_str(), "status": st });
+                if let Origin::Template { connections, .. } = &origin {
+                    action["live_connections"] = json!(connections);
+                }
+                reporter.action(action, format!("create    {name} (from {from}, {}){}", describe_copy(copy), planned(opts.dry_run)));
+                match origin {
+                    Origin::Live { template_refreshed: true } => {
+                        counts.inc("template_refreshed");
+                        let template = db::template_name(&spec.source);
+                        reporter.action(
+                            json!({ "op": "refresh_template", "database": template, "source": spec.source, "copy": copy.as_str(), "status": st }),
+                            format!("refresh   {template} (from {}, {}){}", spec.source, describe_copy(copy), planned(opts.dry_run)),
+                        );
+                    }
+                    Origin::Live { template_refreshed: false } => {}
+                    Origin::Template { connections, created_at } => reporter.warn(format!(
+                        "{} has {connections} open connection{}, so {name} {} a copy of {from}, taken {} ago. For current data, stop the app (or pass --terminate) and run apply --recreate.",
+                        spec.source,
+                        if connections == 1 { "" } else { "s" },
+                        if opts.dry_run { "would be" } else { "is" },
+                        age(&created_at),
+                    )),
+                }
             }
             Ok(ForkStatus::Exists) => {
                 counts.inc("skipped_existing");
@@ -453,5 +489,25 @@ fn drop_forks(
 fn warn_all(problems: &[crate::project::Problem], reporter: &Reporter) {
     for p in problems {
         reporter.warn(&p.detail);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::age;
+    use chrono::{Duration, Utc};
+
+    fn ago(d: Duration) -> String {
+        (Utc::now() - d).to_rfc3339()
+    }
+
+    #[test]
+    fn age_is_coarse_and_pluralized() {
+        assert_eq!(age(&ago(Duration::seconds(5))), "a moment");
+        assert_eq!(age(&ago(Duration::seconds(61))), "1 minute");
+        assert_eq!(age(&ago(Duration::minutes(45))), "45 minutes");
+        assert_eq!(age(&ago(Duration::hours(3))), "3 hours");
+        assert_eq!(age(&ago(Duration::days(3))), "3 days");
+        assert_eq!(age("not a timestamp"), "not a timestamp");
     }
 }

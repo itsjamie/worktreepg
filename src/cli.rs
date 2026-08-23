@@ -50,10 +50,10 @@ enum Command {
         /// Name to derive the database name from (default: the branch, or the directory when detached)
         #[arg(long, value_name = "name")]
         worktree_name: Option<String>,
-        /// Drop the existing fork and clone it again, e.g. after "template refresh"
+        /// Drop the existing fork and clone it again from current data
         #[arg(long)]
         recreate: bool,
-        /// Close open connections to the live database when it has to serve as the template
+        /// Close open connections to the live database and clone it, rather than falling back to the template
         #[arg(long)]
         terminate: bool,
         /// Rewrite the env variable even if it points at some other database
@@ -86,7 +86,7 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Snapshot the live database into <database>_template, the database forks are cloned from
+    /// Manage <database>_template, the snapshot forks are cloned from while the live database is in use
     Template {
         #[arg(value_enum)]
         action: TemplateArg,

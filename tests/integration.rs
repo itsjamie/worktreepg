@@ -48,7 +48,7 @@ struct Db {
 impl Db {
     fn connect(url: &str) -> Self {
         let mut admin = Client::connect(url, NoTls).expect("connect to WORKTREE_PG_TEST_URL");
-        for name in ["app", "app_feature_auth", "app_stale", "app_unmanaged", "app_template"] {
+        for name in ["app", "app_feature_auth", "app_fresh", "app_busy", "app_unmanaged", "app_template"] {
             admin.batch_execute(&format!("ALTER DATABASE \"{name}\" WITH IS_TEMPLATE false")).ok();
             admin.batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)")).unwrap();
         }
@@ -164,6 +164,20 @@ fn end_to_end() {
     assert_eq!(summary(&r, "skipped_existing"), 1);
     assert_eq!(summary(&r, "skipped_same"), 1);
 
+    // without a template, a live database in use cannot be forked at all
+    {
+        let _holder = db.client("app");
+        let r = run(&["apply", "--recreate"], &auth, true);
+        assert_eq!(r.code, 4, "{}", r.stderr);
+        assert!(r.stderr.contains("1 open connection"), "{}", r.stderr);
+        assert!(r.stderr.contains("--terminate"), "{}", r.stderr);
+        let r = run(&["apply", "--recreate", "--dry-run"], &auth, true);
+        assert_eq!(r.code, 4, "{}", r.stderr);
+    }
+    let r = run(&["apply"], &auth, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 1);
+
     // a variable pointing somewhere unexpected is a conflict unless --force
     fs::write(auth.join(".env"), format!("DATABASE_URL=\"{}\"\n", db.url("somewhere_else"))).unwrap();
     let r = run(&["apply"], &auth, true);
@@ -187,52 +201,96 @@ fn end_to_end() {
     git(&["worktree", "remove", "--force", unmanaged.to_str().unwrap()], &repo);
     db.admin.batch_execute("DROP DATABASE \"app_unmanaged\"").unwrap();
 
-    // template create snapshots the live database; forks then come from it
+    // template create snapshots the live database
     let r = run(&["template", "create"], &repo, true);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(summary(&r, "created"), 1);
     assert_eq!(db.flags("app_template"), (true, false));
+    let snapshot_at = db.meta("app_template")["createdAt"].as_str().unwrap().to_string();
     let r = run(&["template", "create"], &repo, true);
     assert_eq!(r.code, 0);
     assert_eq!(summary(&r, "skipped"), 1);
+
+    // with nothing connected to the live database, apply still clones it directly, and brings
+    // the template up to date while it is at it
     db.client("app").batch_execute("INSERT INTO things VALUES ('two')").unwrap();
-    let stale = root.join("app-stale");
-    git(&["worktree", "add", "-q", stale.to_str().unwrap(), "-b", "stale"], &repo);
-    fs::write(stale.join(".env"), &source_env).unwrap();
-    let r = run(&["apply"], &stale, true);
-    assert_eq!(r.code, 0, "{}", r.stderr);
-    assert_eq!(db.things("app_stale"), ["one"]);
-    assert_eq!(db.meta("app_stale")["template"], "app_template");
-
-    // template refresh rebuilds the snapshot; apply --recreate re-forks from it
-    let r = run(&["template", "refresh"], &repo, true);
-    assert_eq!(r.code, 0, "{}", r.stderr);
-    assert_eq!(summary(&r, "dropped"), 1);
-    assert_eq!(summary(&r, "created"), 1);
-    let r = run(&["apply", "--recreate"], &stale, true);
+    let fresh = root.join("app-fresh");
+    git(&["worktree", "add", "-q", fresh.to_str().unwrap(), "-b", "fresh"], &repo);
+    fs::write(fresh.join(".env"), &source_env).unwrap();
+    let r = run(&["apply"], &fresh, true);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(summary(&r, "created"), 1);
-    assert_eq!(db.things("app_stale"), ["one", "two"]);
+    assert_eq!(summary(&r, "template_refreshed"), 1);
+    assert_eq!(db.things("app_fresh"), ["one", "two"]);
+    assert_eq!(db.meta("app_fresh")["template"], "app");
+    let refresh = r.json["actions"].as_array().unwrap().iter().find(|a| a["op"] == "refresh_template").unwrap();
+    assert_eq!(refresh["database"], "app_template");
+    assert_eq!(refresh["source"], "app");
+    assert_eq!(db.flags("app_template"), (true, false));
+    assert_ne!(db.meta("app_template")["createdAt"].as_str().unwrap(), snapshot_at, "template was re-snapshotted");
+    assert_eq!(db.meta("app_template")["source"], "app");
 
-    // copying a database with open connections fails clearly unless --terminate is given
+    // while the live database is in use, apply falls back to the template and says so
+    let busy = root.join("app-busy");
+    git(&["worktree", "add", "-q", busy.to_str().unwrap(), "-b", "busy"], &repo);
+    fs::write(busy.join(".env"), &source_env).unwrap();
     {
-        let _holder = db.client("app");
+        let mut holder = db.client("app");
+        holder.batch_execute("INSERT INTO things VALUES ('three')").unwrap();
+        let r = run(&["apply", "--dry-run"], &busy, true);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let create = r.json["actions"].as_array().unwrap().iter().find(|a| a["op"] == "create_database").unwrap();
+        assert_eq!(create["from"], "app_template");
+        assert_eq!(create["status"], "planned");
+        assert_eq!(summary(&r, "template_refresh_planned"), 0);
+        assert!(!db.exists("app_busy"));
+        let r = run(&["apply"], &busy, false);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert!(r.stdout.contains("create    app_busy (from app_template"), "{}", r.stdout);
+        assert!(r.stderr.contains("app has 1 open connection, so app_busy is a copy of app_template, taken a moment ago"), "{}", r.stderr);
+        assert!(r.stderr.contains("--terminate"), "{}", r.stderr);
+        assert_eq!(db.things("app_busy"), ["one", "two"]);
+        assert_eq!(db.meta("app_busy")["template"], "app_template");
+        let r = run(&["apply", "--recreate"], &busy, true);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let create = r.json["actions"].as_array().unwrap().iter().find(|a| a["op"] == "create_database").unwrap();
+        assert_eq!(create["from"], "app_template");
+        assert_eq!(create["live_connections"], 1);
+        assert_eq!(summary(&r, "template_refreshed"), 0);
+
+        // template refresh itself still needs the live database free, and keeps the old snapshot when it is not
         let r = run(&["template", "refresh"], &repo, true);
         assert_eq!(r.code, 4, "{}", r.stderr);
         assert!(r.stderr.contains("1 open connection"), "{}", r.stderr);
         assert!(r.stderr.contains("--terminate"), "{}", r.stderr);
-        let r = run(&["template", "refresh", "--terminate"], &repo, true);
+        assert_eq!(db.flags("app_template"), (true, false));
+
+        // --terminate closes the connections and clones the live database after all
+        let r = run(&["apply", "--recreate", "--terminate"], &busy, true);
         assert_eq!(r.code, 0, "{}", r.stderr);
+        assert_eq!(summary(&r, "template_refreshed"), 1);
+        assert_eq!(db.things("app_busy"), ["one", "three", "two"]);
+        assert_eq!(db.meta("app_busy")["template"], "app");
+        assert!(holder.batch_execute("SELECT 1").is_err(), "holder's connection was terminated");
     }
+    let r = run(&["remove", busy.to_str().unwrap()], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(!db.exists("app_busy"));
+
+    // template refresh replaces the snapshot on demand
+    let r = run(&["template", "refresh"], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "dropped"), 1);
+    assert_eq!(summary(&r, "created"), 1);
 
     // list shows the template and every fork with its worktree status
     let r = run(&["list"], &repo, true);
     assert_eq!(r.code, 0, "{}", r.stderr);
     let mut names: Vec<&str> = r.json["databases"].as_array().unwrap().iter().map(|d| d["database"].as_str().unwrap()).collect();
     names.sort();
-    assert_eq!(names, ["app_feature_auth", "app_stale", "app_template"]);
-    let stale_row = r.json["databases"].as_array().unwrap().iter().find(|d| d["database"] == "app_stale").unwrap();
-    assert_eq!(stale_row["worktree_exists"], true);
+    assert_eq!(names, ["app_feature_auth", "app_fresh", "app_template"]);
+    let fresh_row = r.json["databases"].as_array().unwrap().iter().find(|d| d["database"] == "app_fresh").unwrap();
+    assert_eq!(fresh_row["worktree_exists"], true);
 
     // human-readable output: one line per database and a summary
     let r = run(&["list"], &repo, false);
@@ -252,15 +310,15 @@ fn end_to_end() {
     assert!(!git(&["worktree", "list"], &repo).contains("app-auth"));
 
     // prune drops forks whose worktree was removed with plain git, and never the template
-    git(&["worktree", "remove", "--force", stale.to_str().unwrap()], &repo);
+    git(&["worktree", "remove", "--force", fresh.to_str().unwrap()], &repo);
     let r = run(&["prune", "--dry-run"], &repo, true);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(summary(&r, "dropped"), 1);
-    assert!(db.exists("app_stale"));
+    assert!(db.exists("app_fresh"));
     let r = run(&["prune"], &repo, true);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(summary(&r, "dropped"), 1);
-    assert!(!db.exists("app_stale"));
+    assert!(!db.exists("app_fresh"));
     assert!(db.exists("app_template"));
 
     // template drop removes the snapshot
