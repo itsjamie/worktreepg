@@ -6,24 +6,32 @@
 //! nothing is ever dropped unless it carries one for the repository at hand.
 //!
 //! Statements run over a connection to a maintenance database (`postgres`, then `template1`)
-//! using the credentials from the env file. The development database itself is never held
-//! open here, so it stays usable as a `TEMPLATE`.
+//! using the credentials of the first env-file variable that named the database being worked on
+//! (see [`Pool`]). The development database itself is never held open here, so it stays usable
+//! as a `TEMPLATE`.
 
 use crate::errors::{conflict, environment};
 use crate::pgurl::PgUrl;
 use crate::storage::{self, Sharing};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use postgres::config::SslMode;
 use postgres::error::SqlState;
 use postgres::{Client, NoTls};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 pub const META_PREFIX: &str = "worktreepg ";
 /// Postgres NAMEDATALEN is 64, so identifiers are at most 63 bytes.
 const MAX_IDENTIFIER: usize = 63;
+
+/// What a role lacks when Postgres refuses a statement. Everything worktreepg runs is ownership
+/// work, except closing someone else's connections: signalling another role's backend is a role
+/// membership of its own, which owning the database does not carry.
+const NEEDS_OWNERSHIP: &str = "That role needs CREATEDB and has to own the database, or be a superuser.";
+const NEEDS_SIGNAL: &str =
+    "Closing another role's connections needs membership in pg_signal_backend, or superuser; owning the database does not confer it.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -202,6 +210,13 @@ pub struct Admin {
     copy: CopyMethod,
     /// Whether the server runs on this host, so its data directory can be inspected.
     local: bool,
+    /// The role every statement here runs as, and the cluster it runs on, for diagnostics.
+    role: String,
+    server: String,
+    /// The other roles the directives offer for the work at hand, sorted. Naming them is as far
+    /// as the advice on a refused statement can go: worktreepg cannot tell which of them, if
+    /// any, owns the database, so it cannot say that reordering would help.
+    others: Vec<String>,
 }
 
 struct ExistingTemplate {
@@ -215,11 +230,24 @@ enum CopyOutcome {
     InUse(i64),
 }
 
+/// What is attached to `database`, for the messages about a copy Postgres refused. `connections`
+/// comes from [`Admin::connections`], which does not see everything a copy is refused over, so
+/// zero of them is not the same as nothing being attached.
+pub fn attached(database: &str, connections: i64) -> String {
+    match connections {
+        0 => format!("something is attached to {database} that is not an ordinary connection (a prepared transaction, or a worker Postgres clears itself)"),
+        1 => format!("{database} has 1 open connection"),
+        n => format!("{database} has {n} open connections"),
+    }
+}
+
 fn in_use(database: &str, connections: i64) -> anyhow::Error {
-    environment(format!(
-        "database \"{database}\" has {connections} open connection{}, so Postgres will not copy it. Stop the app using it, or re-run with --terminate to close those connections.",
-        if connections == 1 { "" } else { "s" }
-    ))
+    let remedy = if connections == 0 {
+        "Retrying may be enough; a prepared transaction has to be committed or rolled back first."
+    } else {
+        "Stop the app using it, or re-run with --terminate to close those connections."
+    };
+    environment(format!("{}, so Postgres will not copy it. {remedy}", attached(database, connections)))
 }
 
 impl Admin {
@@ -233,7 +261,14 @@ impl Admin {
             match config.connect(NoTls) {
                 Ok(mut client) => {
                     let copy = enable_clone(&mut client)?;
-                    return Ok(Self { client, copy, local: url.is_local() });
+                    return Ok(Self {
+                        client,
+                        copy,
+                        local: url.is_local(),
+                        role: url.user.clone(),
+                        server: url.server(),
+                        others: Vec::new(),
+                    });
                 }
                 Err(e) => {
                     let missing = e.code() == Some(&SqlState::INVALID_CATALOG_NAME);
@@ -244,22 +279,58 @@ impl Admin {
                 }
             }
         }
-        Err(environment(format!("cannot connect to {} (tried {})", url.server(), errors.join("; "))))
+        Err(environment(format!("cannot connect to {}{} (tried {})", url.server(), as_role(&url.user), errors.join("; "))))
+    }
+
+    /// Runs a statement, describing it as `action` if Postgres refuses.
+    fn run(&mut self, action: &str, sql: &str) -> Result<()> {
+        self.client.batch_execute(sql).map_err(|e| self.refused(action, NEEDS_OWNERSHIP, e))
+    }
+
+    /// The error for a statement the server rejected. A permission failure names the role,
+    /// because statements run as the role in the first directive URL that named the database,
+    /// which is not necessarily the role in the variable being applied, and says what `needs`
+    /// that role would have to have. The other roles the directives offer are named after it,
+    /// since one of them may be the owner; which one, worktreepg cannot tell.
+    fn refused(&self, action: &str, needs: &str, e: postgres::Error) -> anyhow::Error {
+        let denied = e.as_db_error().filter(|db| db.code() == &SqlState::INSUFFICIENT_PRIVILEGE).map(|db| db.message().to_string());
+        let Some(message) = denied else { return anyhow::Error::new(e).context(action.to_string()) };
+        let mut advice = needs.to_string();
+        if !self.others.is_empty() {
+            let others = self.others.iter().map(|r| format!("\"{r}\"")).collect::<Vec<_>>().join(", ");
+            advice.push_str(&format!(
+                " Statements on a database run as the role in the first directive URL that names it; the other URLs for it connect as {others}, so if one of those owns it, list its URL first."
+            ));
+        }
+        environment(format!("{action}{} on {}: {message}. {advice}", as_role(&self.role), self.server))
     }
 
     pub fn copy_method(&self) -> CopyMethod {
         self.copy
     }
 
-    /// One line describing what the copy method will do to disk usage, for `--verbose`.
-    pub fn storage_note(&mut self) -> Result<String> {
+    /// One line describing what the copy method will do to disk usage, for `--verbose`. The line
+    /// is advisory, and `SHOW data_directory` needs superuser or `pg_read_all_settings`, which
+    /// the role that owns the development database need not have, so a server that will not
+    /// answer, for want of privileges or for any other reason, costs the detail rather than the
+    /// command.
+    pub fn storage_note(&mut self) -> String {
         if self.copy == CopyMethod::WalLog {
-            return Ok("copy method: wal_log (file cloning needs Postgres 18); forks take as much space as the template".into());
+            return "copy method: wal_log (file cloning needs Postgres 18); forks take as much space as the template".into();
         }
-        let data_directory: String = self.client.query_one("SHOW data_directory", &[])?.get(0);
+        let data_directory: String = match self.client.query_one("SHOW data_directory", &[]) {
+            Ok(row) => row.get(0),
+            Err(e) if e.code() == Some(&SqlState::INSUFFICIENT_PRIVILEGE) => {
+                return format!(
+                    "copy method: clone; the data directory is not readable{}, so whether forks share blocks with the template is unknown",
+                    as_role(&self.role)
+                )
+            }
+            Err(e) => return format!("copy method: clone; could not read the data directory: {e}"),
+        };
         let path = Path::new(&data_directory);
         let fs = if self.local { storage::filesystem(path) } else { None };
-        Ok(match fs {
+        match fs {
             Some(fs) => match fs.sharing {
                 Sharing::Shared => format!("copy method: clone; {data_directory} is on {}, forks share blocks with the template", fs.name),
                 Sharing::Depends => format!(
@@ -271,7 +342,7 @@ impl Admin {
             None => format!(
                 "copy method: clone; {data_directory} is not visible from this host (a container or another machine), so whether forks share blocks depends on its filesystem"
             ),
-        })
+        }
     }
 
     pub fn exists(&mut self, name: &str) -> Result<bool> {
@@ -408,7 +479,8 @@ impl Admin {
             return Err(in_use(from, n));
         }
         self.set_meta(name, &Meta::Template { v: 1, repo: repo.to_path_buf(), source: source.to_string(), created_at: now() })?;
-        self.client.batch_execute(&format!("ALTER DATABASE {} WITH IS_TEMPLATE true ALLOW_CONNECTIONS false", ident(name)))?;
+        let sql = format!("ALTER DATABASE {} WITH IS_TEMPLATE true ALLOW_CONNECTIONS false", ident(name));
+        self.run(&format!("flagging database {name} as a template"), &sql)?;
         Ok(())
     }
 
@@ -421,11 +493,26 @@ impl Admin {
         })
     }
 
-    /// Backends connected to `database` other than this one.
+    /// Backends attached to `database` other than this one, for the message explaining a copy
+    /// Postgres refused. Autovacuum workers are excluded: a shared catalog such as `pg_database`
+    /// is vacuumed under whichever database the worker attached to, and Postgres cancels those
+    /// workers itself rather than refusing the copy, so counting one would report an app that is
+    /// not running and advise stopping it. Everything else a copy blocks on (walsenders,
+    /// background workers an extension runs in a database) is counted.
+    ///
+    /// The number describes the situation rather than reproducing what Postgres tested, and can
+    /// be 0 for a database it refused to copy. `pg_stat_activity` shows `backend_type` as NULL
+    /// for sessions of other roles unless this role is a superuser or a member of
+    /// `pg_read_all_stats`, so the exclusion is written NULL-safe: a row that will not say what
+    /// it is counts, which is why the app's own backends are counted at all. A prepared
+    /// transaction, meanwhile, blocks a copy with no row here to count (see [`attached`]).
     fn connections(&mut self, database: &str) -> Result<i64> {
         Ok(self
             .client
-            .query_one("SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", &[&database])?
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND backend_type IS DISTINCT FROM 'autovacuum worker' AND pid <> pg_backend_pid()",
+                &[&database],
+            )?
             .get(0))
     }
 
@@ -465,10 +552,14 @@ impl Admin {
     /// template before it copies anything, so an in-use outcome has created nothing.
     fn create_from(&mut self, name: &str, template: &str, terminate: bool) -> Result<CopyOutcome> {
         if terminate {
-            self.client.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
-                &[&template],
-            )?;
+            // Autovacuum workers are left alone, the way connections() does not count them:
+            // Postgres clears them itself, and one signal Postgres refuses fails the statement for
+            // every backend in it. A role pg_stat_activity masks the view for cannot tell a worker
+            // apart, so this spares only the roles that could have signalled one.
+            let sql = "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND backend_type IS DISTINCT FROM 'autovacuum worker' AND pid <> pg_backend_pid()";
+            self.client
+                .execute(sql, &[&template])
+                .map_err(|e| self.refused(&format!("closing connections to {template}"), NEEDS_SIGNAL, e))?;
         }
         let strategy = match self.copy {
             CopyMethod::WalLog => "",
@@ -478,39 +569,92 @@ impl Admin {
         match self.client.batch_execute(&sql) {
             Ok(()) => Ok(CopyOutcome::Copied),
             Err(e) if e.code() == Some(&SqlState::OBJECT_IN_USE) => Ok(CopyOutcome::InUse(self.connections(template)?)),
-            Err(e) => Err(e).with_context(|| format!("creating database {name}")),
+            Err(e) => Err(self.refused(&format!("creating database {name}"), NEEDS_OWNERSHIP, e)),
         }
     }
 
     fn set_meta(&mut self, name: &str, meta: &Meta) -> Result<()> {
-        self.client.batch_execute(&format!("COMMENT ON DATABASE {} IS {}", ident(name), literal(&meta.encode())))?;
-        Ok(())
+        let sql = format!("COMMENT ON DATABASE {} IS {}", ident(name), literal(&meta.encode()));
+        self.run(&format!("commenting on database {name}"), &sql)
     }
 
     /// `DROP DATABASE ... WITH (FORCE)`, clearing the template flag first when needed.
     fn drop_database(&mut self, name: &str) -> Result<()> {
         let is_template: bool =
             self.client.query_opt("SELECT datistemplate FROM pg_database WHERE datname = $1", &[&name])?.is_some_and(|r| r.get(0));
+        let action = format!("dropping database {name}");
         if is_template {
-            self.client.batch_execute(&format!("ALTER DATABASE {} WITH IS_TEMPLATE false ALLOW_CONNECTIONS true", ident(name)))?;
+            let sql = format!("ALTER DATABASE {} WITH IS_TEMPLATE false ALLOW_CONNECTIONS true", ident(name));
+            self.run(&action, &sql)?;
         }
-        self.client.batch_execute(&format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", ident(name)))?;
-        Ok(())
+        self.run(&action, &format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", ident(name)))
     }
 }
 
-/// One connection per cluster, shared by every variable that points at it.
-#[derive(Default)]
+/// The admin connections a command uses, one per (cluster, role).
+///
+/// Which role a statement runs as is decided by the database it is on, not by the variable that
+/// led to it: the credentials are the first directive URL naming that database, so a repository
+/// whose app connects as a runtime role that owns nothing does all its administration as the
+/// privileged URL listed above it. Work is deduplicated by (cluster, database), so each physical
+/// database is forked, snapshotted, or dropped once however many variables point at it.
+///
+/// One connection per cluster is not enough for that. A cluster can hold two databases owned by
+/// two different roles, and no ordering of the directives gives one role both, so each database's
+/// own owner connects and the connections are pooled per role.
 pub struct Pool {
     admins: HashMap<String, Admin>,
+    /// The distinct roles the directives offer for a database key or a cluster key. The ones
+    /// other than the role that ran a refused statement are named in the error, because
+    /// reordering the directives would put one of them in its place.
+    roles: HashMap<String, HashSet<String>>,
 }
 
 impl Pool {
-    pub fn get(&mut self, url: &PgUrl) -> Result<&mut Admin> {
-        if !self.admins.contains_key(&url.server_key) {
-            self.admins.insert(url.server_key.clone(), Admin::connect(url)?);
+    /// Takes every directive URL, in the order they were read, so first-seen-wins holds and the
+    /// alternatives to each choice are known.
+    pub fn new<'a>(urls: impl IntoIterator<Item = &'a PgUrl>) -> Self {
+        let mut roles: HashMap<String, HashSet<String>> = HashMap::new();
+        for url in urls {
+            roles.entry(url.database_key()).or_default().insert(url.user.clone());
+            roles.entry(url.cluster_key.clone()).or_default().insert(url.user.clone());
         }
-        Ok(self.admins.get_mut(&url.server_key).expect("inserted above"))
+        Self { admins: HashMap::new(), roles }
+    }
+
+    /// The connection for work on `database`, on `url`'s cluster. `url` supplies the credentials:
+    /// pass the URL from [`crate::project::databases`], which is the first that named the
+    /// database. A fork whose source database no directive names any more has no such URL, so
+    /// the cluster's is passed instead, and naming `database` separately keeps the advice on a
+    /// refused statement about the database the statement is on.
+    pub fn for_database(&mut self, url: &PgUrl, database: &str) -> Result<&mut Admin> {
+        let scope = url.database_key_of(database);
+        self.connect(url, &scope)
+    }
+
+    /// The connection for work that spans a cluster: listing what worktreepg manages, finding a
+    /// repository's forks. Pass the URL from [`crate::project::clusters`]. Anything destructive
+    /// that comes out of such a scan runs on the connection for the database it touches.
+    pub fn for_cluster(&mut self, url: &PgUrl) -> Result<&mut Admin> {
+        let scope = url.cluster_key.clone();
+        self.connect(url, &scope)
+    }
+
+    fn connect(&mut self, url: &PgUrl, scope: &str) -> Result<&mut Admin> {
+        let key = url.role_key();
+        if !self.admins.contains_key(&key) {
+            self.admins.insert(key.clone(), Admin::connect(url)?);
+        }
+        let admin = self.admins.get_mut(&key).expect("inserted above");
+        admin.others = match self.roles.get(scope) {
+            Some(roles) => {
+                let mut others: Vec<String> = roles.iter().filter(|r| *r != &admin.role).cloned().collect();
+                others.sort();
+                others
+            }
+            None => Vec::new(),
+        };
+        Ok(admin)
     }
 }
 
@@ -525,6 +669,16 @@ fn enable_clone(client: &mut Client) -> Result<CopyMethod> {
     }
     client.batch_execute("SET file_copy_method = clone")?;
     Ok(CopyMethod::Clone)
+}
+
+/// ` as "role"` for a message, or nothing at all when the URL named no role and libpq falls back
+/// to the operating-system user, which worktreepg never learns.
+fn as_role(role: &str) -> String {
+    if role.is_empty() {
+        String::new()
+    } else {
+        format!(" as \"{role}\"")
+    }
 }
 
 fn ident(name: &str) -> String {

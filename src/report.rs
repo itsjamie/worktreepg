@@ -26,6 +26,11 @@ impl Reporter {
         self.print(line.as_ref());
     }
 
+    /// Whether `verbose` lines are printed, so a caller can skip the work of building one.
+    pub fn is_verbose(&self) -> bool {
+        self.verbose
+    }
+
     pub fn verbose(&self, line: impl AsRef<str>) {
         if self.verbose {
             self.print(line.as_ref());

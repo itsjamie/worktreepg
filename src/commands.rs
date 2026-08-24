@@ -6,7 +6,7 @@ use crate::envfile::EnvFile;
 use crate::errors::{environment, is_conflict, usage, EXIT_CONFLICT, EXIT_INTERNAL};
 use crate::git;
 use crate::pgurl::PgUrl;
-use crate::project::{EnvVar, ProblemKind, Project};
+use crate::project::{clusters, databases, EnvVar, ProblemKind, Project};
 use crate::report::{Counts, Reporter};
 use anyhow::Result;
 use serde_json::{json, Map, Value};
@@ -51,6 +51,30 @@ fn age(timestamp: &str) -> String {
         _ => (secs / 86400, "day"),
     };
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+/// The connection that drops a fork of `source`, which a scan turned up: the credentials of the
+/// first directive URL that names `source` on this cluster. A fork whose source database the
+/// directives no longer name falls back to the cluster's first URL, which is all that is left to
+/// try, and the work is still scoped to `source` rather than to whatever that URL names.
+fn dropper<'a>(pool: &'a mut Pool, live: &[PgUrl], cluster: &PgUrl, source: &str) -> Result<&'a mut db::Admin> {
+    let url = live.iter().find(|u| u.cluster_key == cluster.cluster_key && u.database == source).unwrap_or(cluster);
+    pool.for_database(url, source)
+}
+
+/// The `--verbose` line about what a fork will cost on disk, once per cluster, taken on the first
+/// URL that named the cluster. It describes the copy method rather than reporting a result, so it
+/// is only worth a query when someone is going to read it, and a server that will not answer
+/// costs the line rather than the command.
+fn note_storage(pool: &mut Pool, clusters: &[PgUrl], url: &PgUrl, noted: &mut HashSet<String>, reporter: &Reporter) {
+    if !reporter.is_verbose() || !noted.insert(url.cluster_key.clone()) {
+        return;
+    }
+    let cluster = clusters.iter().find(|c| c.cluster_key == url.cluster_key).unwrap_or(url);
+    match pool.for_cluster(cluster) {
+        Ok(admin) => reporter.verbose(admin.storage_note()),
+        Err(e) => reporter.warn(format!("cannot say how forks will use disk on {}: {e}", cluster.server())),
+    }
 }
 
 pub struct ApplyOptions {
@@ -140,12 +164,17 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
         }
     }
 
-    let mut pool = Pool::default();
+    let mut pool = Pool::new(vars.iter().map(|v| &v.url));
+    let clusters = clusters(&vars);
+    // Every outcome, a conflict and an unusable name included, marks the database handled, so a
+    // second variable naming it neither repeats the work nor reports it twice. `forks` holds only
+    // the databases that ended up with a fork, which is what the rewrite below needs.
+    let mut handled: HashSet<String> = HashSet::new();
     let mut forks: HashMap<String, String> = HashMap::new();
     let mut noted: HashSet<String> = HashSet::new();
     for v in &vars {
         let key = v.url.database_key();
-        if forks.contains_key(&key) {
+        if !handled.insert(key.clone()) {
             continue;
         }
         let name = match db::fork_name(&v.url.database, &worktree_name) {
@@ -164,12 +193,8 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
             branch: branch.clone(),
         };
         let fork_opts = ForkOptions { recreate: opts.recreate, terminate: opts.terminate, dry_run: opts.dry_run };
-        let admin = pool.get(&v.url)?;
-        if noted.insert(v.url.server_key.clone()) {
-            let note = admin.storage_note()?;
-            reporter.verbose(note);
-        }
-        match admin.ensure_fork(&spec, fork_opts) {
+        note_storage(&mut pool, &clusters, &v.url, &mut noted, reporter);
+        match pool.for_database(&v.url, &v.url.database)?.ensure_fork(&spec, fork_opts) {
             Ok(ForkStatus::Forked { from, copy, origin }) => {
                 counts.inc("created");
                 let st = status(opts.dry_run);
@@ -189,9 +214,8 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
                     }
                     Origin::Live { template_refreshed: false } => {}
                     Origin::Template { connections, created_at } => reporter.warn(format!(
-                        "{} has {connections} open connection{}, so {name} {} a copy of {from}, taken {} ago. For current data, stop the app (or pass --terminate) and run apply --recreate.",
-                        spec.source,
-                        if connections == 1 { "" } else { "s" },
+                        "{}, so {name} {} a copy of {from}, taken {} ago. For current data, stop the app (or pass --terminate) and run apply --recreate.",
+                        db::attached(&spec.source, connections),
                         if opts.dry_run { "would be" } else { "is" },
                         age(&created_at),
                     )),
@@ -293,11 +317,12 @@ pub fn prune(project: &Project, dry_run: bool, reporter: &mut Reporter) -> Resul
     project.require_directives()?;
     let living: HashSet<PathBuf> = git::living_worktrees(&project.cwd)?.into_iter().collect();
     let mut counts = Counts::new(&["forks", "dropped", "kept"]);
-    let mut pool = Pool::default();
-    let (databases, problems) = project.databases()?;
+    let (vars, problems) = project.env_vars()?;
     warn_all(&problems, reporter);
-    for url in &databases {
-        for fork in pool.get(url)?.forks_for(&project.repo)? {
+    let mut pool = Pool::new(vars.iter().map(|v| &v.url));
+    let live = databases(&vars);
+    for cluster in &clusters(&vars) {
+        for fork in pool.for_cluster(cluster)?.forks_for(&project.repo)? {
             let Meta::Fork { worktree, .. } = &fork.meta else { continue };
             counts.inc("forks");
             if living.contains(worktree) {
@@ -305,7 +330,7 @@ pub fn prune(project: &Project, dry_run: bool, reporter: &mut Reporter) -> Resul
                 reporter.verbose(format!("keep      {} ({})", fork.name, worktree.display()));
                 continue;
             }
-            pool.get(url)?.drop_fork(&fork.name, dry_run)?;
+            dropper(&mut pool, &live, cluster, fork.meta.source())?.drop_fork(&fork.name, dry_run)?;
             counts.inc("dropped");
             reporter.action(
                 json!({ "op": "drop_database", "database": fork.name, "worktree": worktree, "status": status(dry_run) }),
@@ -322,12 +347,12 @@ pub fn list(project: &Project, all: bool, reporter: &mut Reporter) -> Result<i32
     project.require_directives()?;
     let living: HashSet<PathBuf> = git::living_worktrees(&project.cwd)?.into_iter().collect();
     let mut rows = Vec::new();
-    let mut pool = Pool::default();
-    let (databases, problems) = project.databases()?;
+    let (vars, problems) = project.env_vars()?;
     warn_all(&problems, reporter);
-    for url in &databases {
-        let server = url.server();
-        for m in pool.get(url)?.list_managed()? {
+    let mut pool = Pool::new(vars.iter().map(|v| &v.url));
+    for cluster in &clusters(&vars) {
+        let server = cluster.server();
+        for m in pool.for_cluster(cluster)?.list_managed()? {
             if !all && m.meta.repo() != project.repo {
                 continue;
             }
@@ -381,23 +406,24 @@ pub struct TemplateCommand {
 pub fn template(project: &Project, cmd: &TemplateCommand, reporter: &mut Reporter) -> Result<i32> {
     project.require_directives()?;
     let mut counts = Counts::new(&["created", "dropped", "skipped", "conflicts"]);
-    let mut pool = Pool::default();
-    let (databases, problems) = project.databases()?;
+    let (vars, problems) = project.env_vars()?;
     warn_all(&problems, reporter);
+    let mut pool = Pool::new(vars.iter().map(|v| &v.url));
+    let clusters = clusters(&vars);
+    let mut noted: HashSet<String> = HashSet::new();
     let opts = TemplateOptions {
         replace: cmd.action == TemplateAction::Refresh,
         force: cmd.force,
         terminate: cmd.terminate,
         dry_run: cmd.dry_run,
     };
-    for url in &databases {
+    for url in &databases(&vars) {
         let name = db::template_name(&url.database);
-        let admin = pool.get(url)?;
-        let copy = admin.copy_method();
         if cmd.action != TemplateAction::Drop {
-            let note = admin.storage_note()?;
-            reporter.verbose(note);
+            note_storage(&mut pool, &clusters, url, &mut noted, reporter);
         }
+        let admin = pool.for_database(url, &url.database)?;
+        let copy = admin.copy_method();
         let result = match cmd.action {
             TemplateAction::Drop => admin.drop_template(&url.database, opts),
             _ => admin.snapshot_template(&url.database, &project.repo, opts),
@@ -465,16 +491,17 @@ fn drop_forks(
     counts: &mut Counts,
     select: impl Fn(&Path) -> bool,
 ) -> Result<()> {
-    let mut pool = Pool::default();
-    let (databases, problems) = project.databases()?;
+    let (vars, problems) = project.env_vars()?;
     warn_all(&problems, reporter);
-    for url in &databases {
-        for fork in pool.get(url)?.forks_for(&project.repo)? {
+    let mut pool = Pool::new(vars.iter().map(|v| &v.url));
+    let live = databases(&vars);
+    for cluster in &clusters(&vars) {
+        for fork in pool.for_cluster(cluster)?.forks_for(&project.repo)? {
             let Meta::Fork { worktree, .. } = &fork.meta else { continue };
             if !select(worktree) {
                 continue;
             }
-            pool.get(url)?.drop_fork(&fork.name, dry_run)?;
+            dropper(&mut pool, &live, cluster, fork.meta.source())?.drop_fork(&fork.name, dry_run)?;
             counts.inc("dropped");
             reporter.action(
                 json!({ "op": "drop_database", "database": fork.name, "worktree": worktree, "status": status(dry_run) }),

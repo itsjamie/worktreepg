@@ -121,12 +121,24 @@ impl Project {
         }
         Ok((vars, problems))
     }
+}
 
-    /// The distinct live databases named by the directives, one per (cluster, database name).
-    pub fn databases(&self) -> Result<(Vec<PgUrl>, Vec<Problem>)> {
-        let (vars, problems) = self.env_vars()?;
-        let mut seen = HashSet::new();
-        let databases = vars.into_iter().filter(|v| seen.insert(v.url.database_key())).map(|v| v.url).collect();
-        Ok((databases, problems))
-    }
+/// The distinct live databases the variables name, one per (cluster, database name). Several
+/// variables naming one database with different credentials collapse to the first, whose
+/// credentials every statement on that database then runs as.
+pub fn databases(vars: &[EnvVar]) -> Vec<PgUrl> {
+    distinct(vars, PgUrl::database_key)
+}
+
+/// One URL per cluster, for the work that spans everything a cluster holds rather than one
+/// database at a time. Going by database instead would visit a cluster once per database it
+/// holds, and each of those visits sees every fork on it.
+pub fn clusters(vars: &[EnvVar]) -> Vec<PgUrl> {
+    distinct(vars, |url| url.cluster_key.clone())
+}
+
+/// The variables' URLs, keeping the first of each `key`.
+fn distinct(vars: &[EnvVar], key: impl Fn(&PgUrl) -> String) -> Vec<PgUrl> {
+    let mut seen = HashSet::new();
+    vars.iter().filter(|v| seen.insert(key(&v.url))).map(|v| v.url.clone()).collect()
 }
