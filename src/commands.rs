@@ -190,10 +190,27 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
                 counts.inc("created");
                 let st = status(opts.dry_run);
                 let mut action = json!({ "op": "create_database", "database": name, "from": from, "copy": copy.as_str(), "status": st });
-                if let Origin::Template { connections, .. } = &origin {
-                    action["live_connections"] = json!(connections);
-                }
-                reporter.action(action, format!("create    {name} (from {from}, {}){}", describe_copy(copy), planned(opts.dry_run)));
+                // The age is read once so the JSON action and the fallback warning below cannot
+                // disagree across a second boundary. Both snapshot keys describe when {from} was
+                // taken, not when this fork was created, which is what list's created_at means.
+                let (origin_field, snapshot_age) = match &origin {
+                    Origin::Live { .. } => {
+                        action["origin"] = json!("live");
+                        ("live", None)
+                    }
+                    Origin::Template { connections, created_at } => {
+                        let snapshot_age = age(created_at);
+                        action["origin"] = json!("template");
+                        action["live_connections"] = json!(connections);
+                        action["snapshot_created_at"] = json!(created_at);
+                        action["snapshot_age"] = json!(&snapshot_age);
+                        ("template", Some(snapshot_age))
+                    }
+                };
+                reporter.action(
+                    action,
+                    format!("create    {name} (from {from}, {}, origin={origin_field}){}", describe_copy(copy), planned(opts.dry_run)),
+                );
                 match origin {
                     Origin::Live { template_refreshed: true } => {
                         counts.inc("template_refreshed");
@@ -204,11 +221,11 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
                         );
                     }
                     Origin::Live { template_refreshed: false } => {}
-                    Origin::Template { connections, created_at } => reporter.warn(format!(
+                    Origin::Template { connections, .. } => reporter.warn(format!(
                         "{}, so {name} {} a copy of {from}, taken {} ago. For current data, stop the app (or pass --terminate) and run apply --recreate.",
                         db::attached(&spec.source, connections),
                         if opts.dry_run { "would be" } else { "is" },
-                        age(&created_at),
+                        snapshot_age.unwrap_or_default(),
                     )),
                 }
             }

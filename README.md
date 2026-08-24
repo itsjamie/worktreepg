@@ -79,12 +79,12 @@ cd ../app-auth && portless
 `apply` creates `app_feature_auth` (for a database named `app`) and rewrites `DATABASE_URL` in `../app-auth/.env` to point at it. Everything else in the URL, and everything else in the file, is left as it was. Running it again is a no-op.
 
 ```
-create    app_feature_auth (from app, cloned)
+create    app_feature_auth (from app, cloned, origin=live)
 refresh   app_template (from app, cloned)
 rewrite   .env DATABASE_URL -> app_feature_auth
 ```
 
-With the dev server running, the first line reads `from app_template` instead, and a warning on stderr gives the number of open connections and the snapshot's age. `apply --recreate --terminate` closes those connections and clones the live database after all.
+With the dev server running, the first line reads `from app_template, cloned, origin=template` instead, and a warning on stderr gives the number of open connections and the snapshot's age. `apply --recreate --terminate` closes those connections and clones the live database after all.
 
 The order matters: `git worktreeinclude apply` is what puts `.env` in the new worktree, and worktreepg only edits env files it finds there. If it created the file itself, git-worktreeinclude would later overwrite it (or report a conflict). Running `apply` before the file exists stops with exit code 4 and nothing is created.
 

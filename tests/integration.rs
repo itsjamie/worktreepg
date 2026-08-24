@@ -387,6 +387,9 @@ fn end_to_end() {
     let version: i32 = db.admin.query_one("SHOW server_version_num", &[]).unwrap().get::<_, String>(0).parse().unwrap();
     let create = r.json["actions"].as_array().unwrap().iter().find(|a| a["op"] == "create_database").unwrap();
     assert_eq!(create["copy"], if version >= 180000 { "clone" } else { "wal_log" });
+    assert_eq!(create["origin"], "live");
+    assert!(create.get("snapshot_age").is_none(), "{create}");
+    assert!(create.get("snapshot_created_at").is_none(), "{create}");
     let meta = db.meta("app_feature_auth");
     assert_eq!(meta["kind"], "fork");
     assert_eq!(meta["worktree"], auth.to_str().unwrap());
@@ -397,6 +400,18 @@ fn end_to_end() {
         format!("DATABASE_URL=\"{}?sslmode=disable\"\nOTHER=keep\n", db.url("app_feature_auth"))
     );
     assert_eq!(db.things("app_feature_auth"), ["one"]);
+
+    // origin=live also shows up in the terse per-line output that downstream scripts parse,
+    // not just the --json shape
+    let live_origin = root.join("app-live-origin");
+    git(&["worktree", "add", "-q", live_origin.to_str().unwrap(), "-b", "live-origin"], &repo);
+    fs::write(live_origin.join(".env"), &source_env).unwrap();
+    let r = run(&["apply"], &live_origin, false);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains(", origin=live)"), "{}", r.stdout);
+    let r = run(&["remove", live_origin.to_str().unwrap()], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(!db.exists("app_live_origin"));
 
     // apply is idempotent
     let r = run(&["apply"], &auth, true);
@@ -492,16 +507,21 @@ fn end_to_end() {
     {
         let mut holder = db.client("app");
         holder.batch_execute("INSERT INTO things VALUES ('three')").unwrap();
+        let template_created_at = db.meta("app_template")["createdAt"].as_str().unwrap().to_string();
         let r = run(&["apply", "--dry-run"], &busy, true);
         assert_eq!(r.code, 0, "{}", r.stderr);
         let create = r.json["actions"].as_array().unwrap().iter().find(|a| a["op"] == "create_database").unwrap();
         assert_eq!(create["from"], "app_template");
         assert_eq!(create["status"], "planned");
+        assert_eq!(create["origin"], "template");
+        assert_eq!(create["snapshot_created_at"], template_created_at);
+        assert_eq!(create["snapshot_age"], "a moment");
         assert_eq!(summary(&r, "template_refresh_planned"), 0);
         assert!(!db.exists("app_busy"));
         let r = run(&["apply"], &busy, false);
         assert_eq!(r.code, 0, "{}", r.stderr);
-        assert!(r.stdout.contains("create    app_busy (from app_template"), "{}", r.stdout);
+        assert!(r.stdout.contains("create    app_busy (from app_template, "), "{}", r.stdout);
+        assert!(r.stdout.contains(", origin=template)"), "{}", r.stdout);
         assert!(r.stderr.contains("app has 1 open connection, so app_busy is a copy of app_template, taken a moment ago"), "{}", r.stderr);
         assert!(r.stderr.contains("--terminate"), "{}", r.stderr);
         assert_eq!(db.things("app_busy"), ["one", "two"]);
@@ -511,6 +531,8 @@ fn end_to_end() {
         let create = r.json["actions"].as_array().unwrap().iter().find(|a| a["op"] == "create_database").unwrap();
         assert_eq!(create["from"], "app_template");
         assert_eq!(create["live_connections"], 1, "{}", r.stderr);
+        assert_eq!(create["origin"], "template");
+        assert_eq!(create["snapshot_created_at"], template_created_at);
         assert_eq!(summary(&r, "template_refreshed"), 0);
 
         // template refresh itself still needs the live database free, and keeps the old snapshot when it is not
