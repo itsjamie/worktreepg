@@ -9,7 +9,8 @@ It pairs with [portless](https://github.com/vercel-labs/portless), which already
 ## Requirements
 
 - Postgres 13 or newer (for `DROP DATABASE ... WITH (FORCE)`). Tested against Postgres 18.
-- The connecting role needs `CREATEDB`, and must own the development database or be a superuser, which is the normal situation for a local dev cluster.
+- The connecting role needs `CREATEDB`, and must own the development database or be a superuser, which is the normal situation for a local dev cluster. Only one of the URLs naming a database has to: everything done to that database runs as the role in the first directive URL that names it.
+- `--terminate` closes connections that belong to other roles, which owning the database does not allow. That needs membership in `pg_signal_backend`, or a superuser.
 - `git` on `PATH`.
 - Connections are made without TLS. Local clusters are the target; a server that insists on SSL will reject the admin connection.
 
@@ -49,6 +50,13 @@ The first token is the env file, relative to the worktree root. Everything after
 ```gitignore
 # worktreepg: apps/api/.env DATABASE_URL DIRECT_URL
 # worktreepg: packages/db/.env DATABASE_URL
+```
+
+Variables naming the same database with different credentials are still one database, forked once, and each variable is rewritten keeping its own credentials. Everything done to a database runs as the role in the first directive URL that names that database, so when your app connects as a runtime role that owns nothing, put the URL that owns the database first:
+
+```gitignore
+# worktreepg: .env DATABASE_URL                       <- owns the database
+# worktreepg: apps/api/.env DATABASE_URL AUDIT_URL    <- runtime role, cannot create or drop
 ```
 
 That is enough when your dev server is stopped: `apply` clones the live database as it is at that moment, the way `git worktree add` branches from the current commit. Postgres refuses to copy a database that anything is connected to, though, and dev servers keep connection pools open. For that case, take a snapshot once:
@@ -117,9 +125,9 @@ All commands accept `--from auto|<path>`, `--include <path>`, `--json`, `--quiet
 - The fork is named `<database>_<branch>`, with the branch lowercased and anything outside `[a-z0-9]` turned into `_`, so it never needs quoting: `feature/auth` becomes `app_feature_auth`. The full branch name is used rather than the last segment, so `feature/auth` and `bugfix/auth` do not share a database. On a detached HEAD the worktree directory name is used. `--worktree-name` overrides it.
 - `apply` tries `CREATE DATABASE ... TEMPLATE <database>` first. Postgres checks for other backends before it copies anything, so when the live database is in use nothing has been created yet and the fork is cloned from `<database>_template` instead. When the fork did come from the live database and a snapshot exists, the snapshot is dropped and recreated as a copy of the fork rather than of the live database: nothing is connected to the fork yet, so that cannot fail the way a second copy of the live database could if the app reconnected in between.
 - Every database worktreepg creates carries a `COMMENT ON DATABASE` starting with `worktreepg ` followed by JSON: the repository (its common `.git` directory), the worktree path, the branch, and where it was copied from. `remove`, `prune`, and `list` find databases through that comment, so nothing is dropped unless worktreepg created it for this repository. `psql`'s `\l+` shows the comment.
-- On Postgres 18 and newer, forks and templates are made with `STRATEGY = FILE_COPY` and `file_copy_method = clone`, so the kernel copies the files with `copy_file_range()` (`copyfile` on macOS). On a copy-on-write filesystem (btrfs, bcachefs, APFS, XFS with `reflink=1`, ZFS with block cloning) a fork then shares its blocks with the template and costs no disk until it diverges. Measured on btrfs with an 89 MB database: the clone had 0 B of exclusive extents, where `WAL_LOG` and a plain file copy each wrote a full 88 MiB. The price is the two checkpoints `FILE_COPY` forces, about a second, regardless of size. On filesystems that cannot share blocks the kernel does an ordinary copy, so nothing breaks; `--verbose` reports the copy method and, when the server is local and its data directory is visible, the filesystem it sits on. Inside a container the data directory is not visible from the host, so it says so rather than guessing. Before Postgres 18 the default `WAL_LOG` strategy is used.
+- On Postgres 18 and newer, forks and templates are made with `STRATEGY = FILE_COPY` and `file_copy_method = clone`, so the kernel copies the files with `copy_file_range()` (`copyfile` on macOS). On a copy-on-write filesystem (btrfs, bcachefs, APFS, XFS with `reflink=1`, ZFS with block cloning) a fork then shares its blocks with the template and costs no disk until it diverges. Measured on btrfs with an 89 MB database: the clone had 0 B of exclusive extents, where `WAL_LOG` and a plain file copy each wrote a full 88 MiB. The price is the two checkpoints `FILE_COPY` forces, about a second, regardless of size. On filesystems that cannot share blocks the kernel does an ordinary copy, so nothing breaks; `--verbose` reports the copy method and, when the server is local and its data directory is visible, the filesystem it sits on. Inside a container the data directory is not visible from the host, so it says so rather than guessing. Finding it at all takes `SHOW data_directory`, which needs superuser or `pg_read_all_settings`; a role that has neither gets a line saying so, since the note is a detail and not a result. Before Postgres 18 the default `WAL_LOG` strategy is used.
 - The template is created with `CREATE DATABASE ... TEMPLATE <database>`, then `ALTER DATABASE ... IS_TEMPLATE true ALLOW_CONNECTIONS false`. `IS_TEMPLATE` lets any role with `CREATEDB` clone it and makes a plain `DROP DATABASE` refuse; `ALLOW_CONNECTIONS false` means it can never be "in use" when a fork is being made. `template refresh` checks for connections before dropping the old snapshot, so a refresh that runs into a connected app leaves the snapshot it had.
-- Administrative statements run over a connection to `postgres` (falling back to `template1`) using the credentials from the env file, so the development database itself is never held open by worktreepg.
+- Administrative statements run over a connection to `postgres` (falling back to `template1`), so the development database itself is never held open by worktreepg. Each database on a cluster (`host:port`) is forked, snapshotted, or dropped once however many variables point at it, as the role in the first directive URL that names it. Connections are pooled per role, so a cluster holding two databases with different owners gets one connection each and still does each piece of work once. Scans that span a cluster (`list`, and finding a repository's forks for `remove` and `prune`) go over the first URL that named the cluster, and anything they turn up that has to be dropped is dropped on its own database's connection. A cluster is identified by the host as it is written in the URL, so `localhost` and `127.0.0.1` count as two even when they are one server, and every scan that spans a cluster then runs once per spelling over the same databases. Nothing is forked or dropped twice, but `list` prints each row twice and `prune`'s `forks` and `kept` counts, and the `dropped` count of any `--dry-run`, double with it. Spell the host the same way in every URL. A statement Postgres refuses for want of privileges reports the role it ran as, which is not necessarily the role in the variable being applied, and names the other roles the directives offer for that database.
 - Exit codes match `git-worktreeinclude`: `0` success, `1` internal error, `2` usage error, `3` conflict, `4` environment error (not a git repository, cannot connect, database in use, env file not there yet, no directive).
 
 ## Copy-on-write on macOS
@@ -147,7 +155,7 @@ cargo test                         # now also runs the end-to-end test
 scripts/test-db.sh stop
 ```
 
-The end-to-end test drives the built binary against a temporary git repository with real worktrees and a real cluster, creating and dropping databases named `app`, `app_*`. Point `WORKTREE_PG_TEST_URL` at a superuser on any cluster you do not mind that happening to. CI runs it against the `postgres:18` image.
+The end-to-end tests drive the built binary against temporary git repositories with real worktrees and a real cluster, creating and dropping databases named `app`, `app_*`, `mixed`, `mixed_*`, `owners`, `owners_*`, and login roles named `mixed_runtime`, `owners_ra`, and `owners_rb`. Point `WORKTREE_PG_TEST_URL` at a superuser on any cluster you do not mind that happening to. CI runs it against the `postgres:18` image.
 
 ## License
 

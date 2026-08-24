@@ -16,8 +16,11 @@ pub struct PgUrl {
     /// The connection string exactly as written in the env file.
     pub raw: String,
     pub database: String,
-    /// `user@host:port`; identifies a cluster so several variables pointing at one share a connection.
-    pub server_key: String,
+    /// `host:port`; identifies a cluster, so two variables naming one database are one database
+    /// whichever role each connects as.
+    pub cluster_key: String,
+    /// The role this URL connects as.
+    pub user: String,
     host: String,
 }
 
@@ -46,8 +49,8 @@ impl PgUrl {
             })
             .unwrap_or_default();
         let port = config.get_ports().first().map(|p| p.to_string()).unwrap_or_default();
-        let server_key = format!("{}@{host}:{port}", user.unwrap_or_default());
-        Ok(Self { raw, database, server_key, host })
+        let cluster_key = format!("{host}:{port}");
+        Ok(Self { raw, database, cluster_key, user: user.unwrap_or_default(), host })
     }
 
     /// Loopback or a unix socket, so the server's files may be on this host.
@@ -60,14 +63,25 @@ impl PgUrl {
         with_database(&self.raw, database)
     }
 
-    /// Identifies one database on one cluster.
+    /// Identifies one physical database on one cluster, whatever credentials name it.
     pub fn database_key(&self) -> String {
-        format!("{}/{}", self.server_key, self.database)
+        self.database_key_of(&self.database)
     }
 
-    /// Host description without credentials, for output.
+    /// The same key for another database on this URL's cluster: a fork's source, which a scan
+    /// turned up rather than a directive, so this URL need not name it itself.
+    pub fn database_key_of(&self, database: &str) -> String {
+        format!("{}/{database}", self.cluster_key)
+    }
+
+    /// Identifies one admin connection: a cluster reached as one role.
+    pub fn role_key(&self) -> String {
+        format!("{}@{}", self.user, self.cluster_key)
+    }
+
+    /// The cluster as a person names it, without credentials, for output.
     pub fn server(&self) -> String {
-        self.server_key.trim_start_matches('@').trim_end_matches(':').to_string()
+        self.cluster_key.trim_end_matches(':').to_string()
     }
 }
 
@@ -88,14 +102,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_database_and_server_key() {
+    fn parses_database_and_cluster_key() {
         let u = PgUrl::parse("postgresql://app:s3cret@db.local:5433/app?sslmode=disable").unwrap();
         assert_eq!(u.database, "app");
-        assert_eq!(u.server_key, "app@db.local:5433");
-        assert_eq!(u.server(), "app@db.local:5433");
+        assert_eq!(u.user, "app");
+        assert_eq!(u.cluster_key, "db.local:5433");
+        assert_eq!(u.server(), "db.local:5433");
         assert!(!u.is_local());
         assert!(PgUrl::parse("postgres://u@localhost/db").unwrap().is_local());
         assert!(PgUrl::parse("postgres://u@/db?host=/var/run/postgresql").unwrap().is_local());
+        assert_eq!(PgUrl::parse("postgres://u@/db?host=/var/run/postgresql").unwrap().server(), "/var/run/postgresql");
+    }
+
+    #[test]
+    fn credentials_do_not_split_a_cluster_or_a_database() {
+        let owner = PgUrl::parse("postgres://postgres:pw@127.0.0.1:5432/app").unwrap();
+        let runtime = PgUrl::parse("postgres://app_user:other@127.0.0.1:5432/app").unwrap();
+        let audit = PgUrl::parse("postgres://app_user:other@127.0.0.1:5432/audit").unwrap();
+        assert_eq!(owner.cluster_key, runtime.cluster_key);
+        assert_eq!(owner.database_key(), runtime.database_key());
+        assert_eq!(audit.cluster_key, owner.cluster_key);
+        assert_ne!(audit.database_key(), owner.database_key());
+        assert_ne!(owner.role_key(), runtime.role_key());
+        assert_eq!(runtime.role_key(), audit.role_key());
+        // a database on the cluster that this URL does not name itself
+        assert_eq!(owner.database_key_of("audit"), audit.database_key());
     }
 
     #[test]

@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use worktreepg::pgurl::with_database;
+use worktreepg::pgurl::{redact, with_database};
 
 struct Run {
     code: i32,
@@ -46,18 +46,75 @@ struct Db {
 }
 
 impl Db {
-    fn connect(url: &str) -> Self {
+    /// Drops whatever a previous run left behind under `source` and creates it fresh. Tests run
+    /// in parallel against one cluster, so each picks a source name of its own.
+    fn connect(url: &str, source: &str) -> Self {
+        // url_as rebuilds this URL as another role, which it can only do by replacing a
+        // user:password authority. Any other form (a unix socket, no credentials) would leave a
+        // URL pointing at libpq's default server rather than at the one the test set up.
+        assert!(
+            url.split_once("://").and_then(|(_, rest)| rest.split_once('@')).is_some_and(|(userinfo, _)| userinfo.contains(':')),
+            "WORKTREE_PG_TEST_URL must be postgres://user:password@host:port/database, not {}",
+            redact(url)
+        );
         let mut admin = Client::connect(url, NoTls).expect("connect to WORKTREE_PG_TEST_URL");
-        for name in ["app", "app_feature_auth", "app_fresh", "app_busy", "app_unmanaged", "app_template"] {
+        let rows = admin
+            .query("SELECT datname FROM pg_database WHERE datname = $1 OR datname LIKE $2", &[&source, &format!("{source}\\_%")])
+            .unwrap();
+        for name in rows.iter().map(|r| r.get::<_, String>(0)) {
             admin.batch_execute(&format!("ALTER DATABASE \"{name}\" WITH IS_TEMPLATE false")).ok();
             admin.batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)")).unwrap();
         }
-        admin.batch_execute("CREATE DATABASE \"app\"").unwrap();
+        admin.batch_execute(&format!("CREATE DATABASE \"{source}\"")).unwrap();
         Self { admin, admin_url: url.to_string() }
     }
 
     fn url(&self, database: &str) -> String {
         with_database(&self.admin_url, database)
+    }
+
+    /// The same URL as the admin one, as another role, with the password [`Db::create_role`]
+    /// gives it. Only the credentials and the database change, so a port, an `sslmode`, or
+    /// anything else in `WORKTREE_PG_TEST_URL` is carried over rather than dropped.
+    fn url_as(&self, role: &str, database: &str) -> String {
+        let url = self.url(database);
+        let (scheme, rest) = url.split_once("://").expect("scheme");
+        let (_, tail) = rest.split_once('@').expect("credentials, checked in connect");
+        format!("{scheme}://{role}:pw@{tail}")
+    }
+
+    /// A role that can log in and nothing else: no CREATEDB, and it owns no database.
+    fn role(&mut self, name: &str) {
+        self.create_role(name, "NOCREATEDB");
+    }
+
+    /// A role that owns `database` and can fork it, the way a per-service owner does on a cluster
+    /// that holds several development databases.
+    fn owner_of(&mut self, role: &str, database: &str) {
+        self.create_role(role, "CREATEDB");
+        self.admin.batch_execute(&format!("CREATE DATABASE \"{database}\" OWNER \"{role}\"")).unwrap();
+    }
+
+    fn create_role(&mut self, name: &str, createdb: &str) {
+        self.admin
+            .batch_execute(&format!(
+                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{name}') THEN CREATE ROLE \"{name}\" LOGIN PASSWORD 'pw' {createdb}; END IF; END $$"
+            ))
+            .unwrap();
+    }
+
+    fn grant(&mut self, role: &str, group: &str) {
+        self.admin.batch_execute(&format!("GRANT \"{group}\" TO \"{role}\"")).unwrap();
+    }
+
+    /// Cleanup goes by database name, so a role a test creates has to be dropped by that test,
+    /// after the databases it could own are gone.
+    fn drop_role(&mut self, name: &str) {
+        self.admin.batch_execute(&format!("DROP ROLE IF EXISTS \"{name}\"")).unwrap();
+    }
+
+    fn owner(&mut self, database: &str) -> String {
+        self.admin.query_one("SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = $1", &[&database]).unwrap().get(0)
     }
 
     fn client(&self, database: &str) -> Client {
@@ -104,12 +161,12 @@ fn end_to_end() {
         eprintln!("skipping end_to_end: set WORKTREE_PG_TEST_URL (see scripts/test-db.sh)");
         return;
     };
-    let mut db = Db::connect(&admin_url);
+    let mut db = Db::connect(&admin_url, "app");
     let live_url = db.url("app");
-    {
-        let mut live = db.client("app");
-        live.batch_execute("CREATE TABLE things (name text PRIMARY KEY); INSERT INTO things VALUES ('one')").unwrap();
-    }
+    let mut live = db.client("app");
+    live.batch_execute("CREATE TABLE things (name text PRIMARY KEY); INSERT INTO things VALUES ('one')").unwrap();
+    // closed rather than dropped: the next apply refuses to copy a database anything is connected to
+    live.close().unwrap();
 
     let root = tempfile::tempdir().unwrap();
     let root: PathBuf = root.path().canonicalize().unwrap();
@@ -213,7 +270,9 @@ fn end_to_end() {
 
     // with nothing connected to the live database, apply still clones it directly, and brings
     // the template up to date while it is at it
-    db.client("app").batch_execute("INSERT INTO things VALUES ('two')").unwrap();
+    let mut live = db.client("app");
+    live.batch_execute("INSERT INTO things VALUES ('two')").unwrap();
+    live.close().unwrap();
     let fresh = root.join("app-fresh");
     git(&["worktree", "add", "-q", fresh.to_str().unwrap(), "-b", "fresh"], &repo);
     fs::write(fresh.join(".env"), &source_env).unwrap();
@@ -255,7 +314,7 @@ fn end_to_end() {
         assert_eq!(r.code, 0, "{}", r.stderr);
         let create = r.json["actions"].as_array().unwrap().iter().find(|a| a["op"] == "create_database").unwrap();
         assert_eq!(create["from"], "app_template");
-        assert_eq!(create["live_connections"], 1);
+        assert_eq!(create["live_connections"], 1, "{}", r.stderr);
         assert_eq!(summary(&r, "template_refreshed"), 0);
 
         // template refresh itself still needs the live database free, and keeps the old snapshot when it is not
@@ -334,4 +393,235 @@ fn end_to_end() {
     assert!(r.stderr.contains("no \"# worktreepg\" directive"), "{}", r.stderr);
 
     db.admin.batch_execute("DROP DATABASE \"app\" WITH (FORCE)").unwrap();
+}
+
+/// A repository whose app connects as a runtime role that owns nothing: one directive URL is
+/// privileged and the others are not. Every administrative statement has to run as the first.
+#[test]
+fn mixed_credentials() {
+    let Ok(admin_url) = std::env::var("WORKTREE_PG_TEST_URL") else {
+        eprintln!("skipping mixed_credentials: set WORKTREE_PG_TEST_URL (see scripts/test-db.sh)");
+        return;
+    };
+    let mut db = Db::connect(&admin_url, "mixed");
+    db.role("mixed_runtime");
+    // so a run that gets as far as a statement fails on ownership, which is what this test is
+    // about, and never on the SHOW data_directory behind the --verbose storage note
+    db.grant("mixed_runtime", "pg_read_all_settings");
+    let owner_url = db.url("mixed");
+    let runtime_url = db.url_as("mixed_runtime", "mixed");
+
+    let root = tempfile::tempdir().unwrap();
+    let root: PathBuf = root.path().canonicalize().unwrap();
+    let repo = root.join("mixed");
+    fs::create_dir(&repo).unwrap();
+    git(&["init", "-q", "-b", "main"], &repo);
+    fs::write(repo.join(".gitignore"), ".env\nruntime.env\n.worktreeinclude\nruntime.worktreeinclude\nreversed.worktreeinclude\n").unwrap();
+    let include = "# worktreepg: .env DATABASE_URL\n# worktreepg: runtime.env DATABASE_URL\n.env\nruntime.env\n";
+    fs::write(repo.join(".worktreeinclude"), include).unwrap();
+    // the same database, named only by the role that does not own it
+    fs::write(repo.join("runtime.worktreeinclude"), "# worktreepg: runtime.env DATABASE_URL\nruntime.env\n").unwrap();
+    // both roles, the wrong one first
+    fs::write(
+        repo.join("reversed.worktreeinclude"),
+        "# worktreepg: runtime.env DATABASE_URL\n# worktreepg: .env DATABASE_URL\nruntime.env\n.env\n",
+    )
+    .unwrap();
+    let owner_env = format!("DATABASE_URL=\"{owner_url}\"\n");
+    let runtime_env = format!("DATABASE_URL=\"{runtime_url}\"\n");
+    fs::write(repo.join(".env"), &owner_env).unwrap();
+    fs::write(repo.join("runtime.env"), &runtime_env).unwrap();
+    fs::write(repo.join("README.md"), "mixed\n").unwrap();
+    git(&["add", "."], &repo);
+    git(&["commit", "-q", "-m", "init"], &repo);
+
+    let work = root.join("mixed-work");
+    git(&["worktree", "add", "-q", work.to_str().unwrap(), "-b", "work"], &repo);
+    fs::write(work.join(".env"), &owner_env).unwrap();
+    fs::write(work.join("runtime.env"), &runtime_env).unwrap();
+
+    // one fork for the one database, and each variable keeps its own credentials
+    let r = run(&["apply"], &work, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "matched"), 2);
+    assert_eq!(summary(&r, "created"), 1);
+    assert_eq!(summary(&r, "rewritten"), 2);
+    assert_eq!(fs::read_to_string(work.join(".env")).unwrap(), format!("DATABASE_URL=\"{}\"\n", db.url("mixed_work")));
+    assert_eq!(
+        fs::read_to_string(work.join("runtime.env")).unwrap(),
+        format!("DATABASE_URL=\"{}\"\n", db.url_as("mixed_runtime", "mixed_work"))
+    );
+
+    // template create runs once, as the owner
+    let r = run(&["template", "create"], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 1);
+
+    // the destructive paths: dropping the fork and dropping the snapshot both need the owner
+    let r = run(&["apply", "--recreate"], &work, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 1);
+    assert_eq!(summary(&r, "skipped_same"), 2);
+    let r = run(&["template", "refresh"], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "dropped"), 1);
+    assert_eq!(summary(&r, "created"), 1);
+
+    // list reports each database once, not once per set of credentials
+    let r = run(&["list"], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let mut names: Vec<&str> = r.json["databases"].as_array().unwrap().iter().map(|d| d["database"].as_str().unwrap()).collect();
+    names.sort();
+    assert_eq!(names, ["mixed_template", "mixed_work"]);
+
+    // and remove drops the fork once
+    let r = run(&["remove", work.to_str().unwrap()], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "dropped"), 1);
+    assert!(!db.exists("mixed_work"));
+
+    // with only the runtime role listed there is nothing to fall back on. The error names the
+    // statement and the role it ran as, and suggests no ordering, because there is no other URL
+    // to put first
+    let again = root.join("mixed-again");
+    git(&["worktree", "add", "-q", again.to_str().unwrap(), "-b", "again"], &repo);
+    fs::write(again.join(".env"), &owner_env).unwrap();
+    fs::write(again.join("runtime.env"), &runtime_env).unwrap();
+    let r = run(&["apply", "--include", "runtime.worktreeinclude"], &again, true);
+    assert_eq!(r.code, 4, "{}", r.stderr);
+    assert!(r.stderr.contains("creating database mixed_again as \"mixed_runtime\""), "{}", r.stderr);
+    assert!(r.stderr.contains("permission denied"), "{}", r.stderr);
+    assert!(r.stderr.contains("needs CREATEDB"), "{}", r.stderr);
+    assert!(!r.stderr.contains("list its URL first"), "{}", r.stderr);
+    assert!(!db.exists("mixed_again"));
+
+    // list the unprivileged URL first and everything runs as it. The message says what the role
+    // lacked and names the other role the directives offer, which is as far as it can go: nothing
+    // here knows which of them owns the database
+    let reversed = root.join("mixed-reversed");
+    git(&["worktree", "add", "-q", reversed.to_str().unwrap(), "-b", "reversed"], &repo);
+    fs::write(reversed.join(".env"), &owner_env).unwrap();
+    fs::write(reversed.join("runtime.env"), &runtime_env).unwrap();
+    let r = run(&["apply", "--include", "reversed.worktreeinclude"], &reversed, true);
+    assert_eq!(r.code, 4, "{}", r.stderr);
+    assert!(r.stderr.contains("creating database mixed_reversed as \"mixed_runtime\""), "{}", r.stderr);
+    assert!(r.stderr.contains("needs CREATEDB"), "{}", r.stderr);
+    let admin_role: String = db.admin.query_one("SELECT current_user", &[]).unwrap().get(0);
+    assert!(r.stderr.contains(&format!("the other URLs for it connect as \"{admin_role}\"")), "{}", r.stderr);
+    assert!(r.stderr.contains("list its URL first"), "{}", r.stderr);
+    assert!(!db.exists("mixed_reversed"));
+
+    let r = run(&["template", "drop"], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(!db.exists("mixed_template"));
+    db.admin.batch_execute("DROP DATABASE \"mixed\" WITH (FORCE)").unwrap();
+    db.drop_role("mixed_runtime");
+}
+
+/// One cluster holding two databases owned by two different roles. Neither role owns both, so no
+/// ordering of the directives gives one set of credentials the run of the cluster: each database
+/// has to be worked as the role in the first URL that names that database.
+#[test]
+fn two_owners_on_one_cluster() {
+    let Ok(admin_url) = std::env::var("WORKTREE_PG_TEST_URL") else {
+        eprintln!("skipping two_owners_on_one_cluster: set WORKTREE_PG_TEST_URL (see scripts/test-db.sh)");
+        return;
+    };
+    let mut db = Db::connect(&admin_url, "owners");
+    db.owner_of("owners_ra", "owners_alpha");
+    db.owner_of("owners_rb", "owners_beta");
+    let alpha_url = db.url_as("owners_ra", "owners_alpha");
+    let beta_url = db.url_as("owners_rb", "owners_beta");
+
+    let root = tempfile::tempdir().unwrap();
+    let root: PathBuf = root.path().canonicalize().unwrap();
+    let repo = root.join("owners");
+    fs::create_dir(&repo).unwrap();
+    git(&["init", "-q", "-b", "main"], &repo);
+    fs::write(repo.join(".gitignore"), ".env\n.worktreeinclude\n").unwrap();
+    fs::write(repo.join(".worktreeinclude"), "# worktreepg: .env ALPHA_URL BETA_URL\n.env\n").unwrap();
+    let env = format!("ALPHA_URL=\"{alpha_url}\"\nBETA_URL=\"{beta_url}\"\n");
+    fs::write(repo.join(".env"), &env).unwrap();
+    fs::write(repo.join("README.md"), "owners\n").unwrap();
+    git(&["add", "."], &repo);
+    git(&["commit", "-q", "-m", "init"], &repo);
+
+    let work = root.join("owners-work");
+    git(&["worktree", "add", "-q", work.to_str().unwrap(), "-b", "two"], &repo);
+    fs::write(work.join(".env"), &env).unwrap();
+
+    // both databases are forked, each by its own owner, and both variables are rewritten
+    let r = run(&["apply", "--verbose"], &work, false);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains("created=2"), "{}", r.stdout);
+    assert!(r.stdout.contains("rewritten=2"), "{}", r.stdout);
+    assert_eq!(db.owner("owners_alpha_two"), "owners_ra");
+    assert_eq!(db.owner("owners_beta_two"), "owners_rb");
+    assert_eq!(
+        fs::read_to_string(work.join(".env")).unwrap(),
+        format!(
+            "ALPHA_URL=\"{}\"\nBETA_URL=\"{}\"\n",
+            db.url_as("owners_ra", "owners_alpha_two"),
+            db.url_as("owners_rb", "owners_beta_two")
+        )
+    );
+    // neither owner can read data_directory, and the storage note is worth less than the command
+    assert!(r.stdout.contains("data directory is not readable"), "{}", r.stdout);
+
+    // a snapshot of each, taken as each owner
+    let r = run(&["template", "create"], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 2);
+    assert_eq!(db.owner("owners_alpha_template"), "owners_ra");
+
+    // the destructive path: each fork is dropped and re-made by the role that owns its source
+    let r = run(&["apply", "--recreate"], &work, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 2);
+    assert_eq!(summary(&r, "template_refreshed"), 2);
+
+    // a live database in use falls back to its template, and the count in that message is taken
+    // on the owner's connection rather than a superuser's: pg_stat_activity gives a plain role
+    // NULL for backend_type on every session but its own, so a query that leans on that column
+    // sees no connections at all and reports a database nothing is attached to
+    let busy = root.join("owners-busy");
+    git(&["worktree", "add", "-q", busy.to_str().unwrap(), "-b", "busy"], &repo);
+    fs::write(busy.join(".env"), &env).unwrap();
+    {
+        // held as the superuser, so owners_ra is not the role that owns this backend
+        let _holder = db.client("owners_alpha");
+        let r = run(&["apply"], &busy, true);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        let create = r.json["actions"].as_array().unwrap().iter().find(|a| a["database"] == "owners_alpha_busy").unwrap();
+        assert_eq!(create["from"], "owners_alpha_template");
+        assert_eq!(create["live_connections"], 1, "{}", r.stdout);
+    }
+    let r = run(&["remove", busy.to_str().unwrap()], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "dropped"), 2);
+
+    let r = run(&["list"], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let mut names: Vec<&str> = r.json["databases"].as_array().unwrap().iter().map(|d| d["database"].as_str().unwrap()).collect();
+    names.sort();
+    assert_eq!(names, ["owners_alpha_template", "owners_alpha_two", "owners_beta_template", "owners_beta_two"]);
+    // the server field is the cluster, so it carries no role name
+    assert!(!r.json["databases"][0]["server"].as_str().unwrap().contains('@'), "{}", r.stdout);
+
+    // and remove drops both forks, each on its own owner's connection
+    let r = run(&["remove", work.to_str().unwrap()], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "dropped"), 2);
+    assert!(!db.exists("owners_alpha_two"));
+    assert!(!db.exists("owners_beta_two"));
+
+    let r = run(&["template", "drop"], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "dropped"), 2);
+
+    for name in ["owners_alpha", "owners_beta", "owners"] {
+        db.admin.batch_execute(&format!("DROP DATABASE \"{name}\" WITH (FORCE)")).unwrap();
+    }
+    db.drop_role("owners_ra");
+    db.drop_role("owners_rb");
 }
