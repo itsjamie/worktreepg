@@ -11,7 +11,7 @@ use crate::report::{Counts, Reporter};
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn document(pairs: Vec<(&str, Value)>) -> Map<String, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
@@ -376,9 +376,13 @@ pub struct RemoveOptions {
     pub force: bool,
 }
 
-/// Removes a worktree and drops the forks made for it. The worktree goes first so git's own
-/// checks (uncommitted changes, locks) run before anything irreversible happens; a fork left
-/// behind by a failure is picked up by `prune`.
+/// Removes a worktree and drops the forks made for it. Every database the directives name is
+/// connected to before anything is touched, so a server that cannot be reached fails the
+/// command while the worktree is still there to re-run it against; the price is that a
+/// directive naming a cluster that is gone for good blocks `remove` until the directive or the
+/// env file is fixed. Git's own checks (uncommitted changes, locks) still run, and the
+/// worktree still goes, before any database is dropped; a fork left behind by a failure past
+/// that point is picked up by `prune`.
 pub fn remove(project: &Project, opts: &RemoveOptions, reporter: &mut Reporter) -> Result<i32> {
     project.require_directives()?;
     let target = git::canonical(&project.cwd.join(opts.path.as_deref().unwrap_or(".")));
@@ -388,6 +392,20 @@ pub fn remove(project: &Project, opts: &RemoveOptions, reporter: &mut Reporter) 
     let registered = git::living_worktrees(&project.cwd)?.contains(&target);
     let mut counts = Counts::new(&["worktree_removed", "dropped"]);
     let doc = document(vec![("dry_run", json!(opts.dry_run)), ("worktree", json!(target))]);
+
+    // Every database the directives name, not only the ones holding a fork of this worktree:
+    // telling those apart needs the connection anyway. One connection per (cluster, role) is
+    // enough to cover the cluster scans below as well, because the first URL naming a cluster is
+    // also the first URL naming its own database. The error names the state the command stopped
+    // in, since a bare connection failure reads the same on either side of the removal.
+    let (vars, problems) = project.env_vars()?;
+    warn_all(&problems, reporter);
+    let mut pool = Pool::new(vars.iter().map(|v| &v.url));
+    let live = databases(&vars);
+    for url in &live {
+        pool.for_database(url, &url.database)
+            .map_err(|e| environment(format!("{e}; {} was left in place and no database was dropped", target.display())))?;
+    }
 
     if registered && !opts.keep_worktree {
         if !opts.dry_run {
@@ -402,7 +420,20 @@ pub fn remove(project: &Project, opts: &RemoveOptions, reporter: &mut Reporter) 
         reporter.verbose(format!("{} is not a registered worktree; dropping its databases only", target.display()));
     }
 
-    drop_forks(project, opts.dry_run, reporter, &mut counts, |meta_worktree| meta_worktree == target)?;
+    for cluster in &clusters(&vars) {
+        for fork in pool.for_cluster(cluster)?.forks_for(&project.repo)? {
+            let Meta::Fork { worktree, .. } = &fork.meta else { continue };
+            if worktree != &target {
+                continue;
+            }
+            dropper(&mut pool, &live, cluster, fork.meta.source())?.drop_fork(&fork.name, opts.dry_run)?;
+            counts.inc("dropped");
+            reporter.action(
+                json!({ "op": "drop_database", "database": fork.name, "worktree": worktree, "status": status(opts.dry_run) }),
+                format!("drop      {}{}", fork.name, planned(opts.dry_run)),
+            );
+        }
+    }
     reporter.finish(doc, &counts);
     Ok(0)
 }
@@ -576,35 +607,6 @@ pub fn template(project: &Project, cmd: &TemplateCommand, reporter: &mut Reporte
     };
     reporter.finish(document(vec![("dry_run", json!(cmd.dry_run)), ("action", json!(action))]), &counts);
     Ok(if counts.get("conflicts") > 0 { EXIT_CONFLICT } else { 0 })
-}
-
-/// Drops the repository's forks whose recorded worktree satisfies `select`.
-fn drop_forks(
-    project: &Project,
-    dry_run: bool,
-    reporter: &mut Reporter,
-    counts: &mut Counts,
-    select: impl Fn(&Path) -> bool,
-) -> Result<()> {
-    let (vars, problems) = project.env_vars()?;
-    warn_all(&problems, reporter);
-    let mut pool = Pool::new(vars.iter().map(|v| &v.url));
-    let live = databases(&vars);
-    for cluster in &clusters(&vars) {
-        for fork in pool.for_cluster(cluster)?.forks_for(&project.repo)? {
-            let Meta::Fork { worktree, .. } = &fork.meta else { continue };
-            if !select(worktree) {
-                continue;
-            }
-            dropper(&mut pool, &live, cluster, fork.meta.source())?.drop_fork(&fork.name, dry_run)?;
-            counts.inc("dropped");
-            reporter.action(
-                json!({ "op": "drop_database", "database": fork.name, "worktree": worktree, "status": status(dry_run) }),
-                format!("drop      {}{}", fork.name, planned(dry_run)),
-            );
-        }
-    }
-    Ok(())
 }
 
 /// Problems reading the source env files are warnings for the database-management commands.

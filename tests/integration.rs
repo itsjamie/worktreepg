@@ -328,6 +328,16 @@ fn a_moved_worktree_is_a_conflict_that_names_its_remedies() {
     assert_eq!(env_database(&after), "movd_moved");
 }
 
+/// Same credentials and database as `url`, but a port nothing listens on, so connecting fails
+/// immediately instead of hanging. Credentials are optional: a cluster reached under trust or
+/// peer auth has none.
+fn unreachable(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").expect("url has a scheme");
+    let (authority, database) = rest.split_once('/').expect("url has a database");
+    let credentials = authority.rsplit_once('@').map_or(String::new(), |(before_at, _)| format!("{before_at}@"));
+    format!("{scheme}://{credentials}127.0.0.1:1/{database}")
+}
+
 #[test]
 fn end_to_end() {
     let Some(admin_url) = test_url("end_to_end") else { return };
@@ -518,9 +528,17 @@ fn end_to_end() {
         assert_eq!(db.meta("app_busy")["template"], "app");
         assert!(holder.batch_execute("SELECT 1").is_err(), "holder's connection was terminated");
     }
+    // --keep-worktree only drops the database
+    let r = run(&["remove", "--keep-worktree", busy.to_str().unwrap()], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "worktree_removed"), 0);
+    assert_eq!(summary(&r, "dropped"), 1);
+    assert!(!db.exists("app_busy"));
+    assert!(git(&["worktree", "list"], &repo).contains("app-busy"), "worktree kept");
     let r = run(&["remove", busy.to_str().unwrap()], &repo, true);
     assert_eq!(r.code, 0, "{}", r.stderr);
-    assert!(!db.exists("app_busy"));
+    assert_eq!(summary(&r, "worktree_removed"), 1);
+    assert!(!git(&["worktree", "list"], &repo).contains("app-busy"));
 
     // template refresh replaces the snapshot on demand
     db.wait_idle("app");
@@ -547,6 +565,17 @@ fn end_to_end() {
     let r = run(&["list", "--quiet"], &repo, false);
     assert_eq!(r.stdout, "");
 
+    // remove connects to every cluster its directives name before touching anything, so a server
+    // it cannot reach leaves both the worktree and the fork alone, and says which state it left
+    fs::write(repo.join(".env"), format!("DATABASE_URL=\"{}?sslmode=disable\"\nOTHER=keep\n", unreachable(&live_url))).unwrap();
+    let r = run(&["remove", auth.to_str().unwrap()], &repo, true);
+    assert_eq!(r.code, 4, "{}", r.stderr);
+    assert!(r.stderr.contains("cannot connect"), "{}", r.stderr);
+    assert!(r.stderr.contains("was left in place and no database was dropped"), "{}", r.stderr);
+    assert!(git(&["worktree", "list"], &repo).contains("app-auth"), "worktree survives a failed pre-flight");
+    assert!(db.exists("app_feature_auth"), "fork survives a failed pre-flight");
+    fs::write(repo.join(".env"), &source_env).unwrap();
+
     // remove drops the fork and the worktree
     let r = run(&["remove", auth.to_str().unwrap()], &repo, true);
     assert_eq!(r.code, 0, "{}", r.stderr);
@@ -554,6 +583,14 @@ fn end_to_end() {
     assert_eq!(summary(&r, "dropped"), 1);
     assert!(!db.exists("app_feature_auth"));
     assert!(!git(&["worktree", "list"], &repo).contains("app-auth"));
+
+    // remove --dry-run touches nothing
+    let r = run(&["remove", "--dry-run", fresh.to_str().unwrap()], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "worktree_removed"), 1);
+    assert_eq!(summary(&r, "dropped"), 1);
+    assert!(db.exists("app_fresh"), "dry-run does not drop anything");
+    assert!(git(&["worktree", "list"], &repo).contains("app-fresh"), "dry-run does not remove the worktree");
 
     // prune drops forks whose worktree was removed with plain git, and never the template
     git(&["worktree", "remove", "--force", fresh.to_str().unwrap()], &repo);
