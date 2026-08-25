@@ -24,6 +24,14 @@ jobs:
       WORKTREE_PG_TEST_URL: postgres://postgres:pw@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v6
+      # Same reason as scripts/test-db.sh, which passes -c autovacuum=off to the container it
+      # starts: worktreepg counts connections through pg_stat_activity, which lists autovacuum
+      # workers next to client backends, and the tests assert on exact counts. A service
+      # container takes no command arguments, so it is reloaded into the running cluster.
+      - name: Stop autovacuum on the test cluster
+        run: |
+          docker exec ${{ job.services.postgres.id }} \
+            psql -U postgres -v ON_ERROR_STOP=1 -c 'ALTER SYSTEM SET autovacuum = off' -c 'SELECT pg_reload_conf()'
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt

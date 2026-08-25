@@ -1,6 +1,7 @@
 //! End-to-end: the real binary against a real git repository with worktrees and a real
 //! Postgres cluster. Needs `WORKTREE_PG_TEST_URL` pointing at a superuser on a maintenance
-//! database (see scripts/test-db.sh); skips otherwise.
+//! database of a cluster running with autovacuum off, which is what the exact connection counts
+//! asserted on here need (scripts/test-db.sh starts one); skips otherwise.
 
 use postgres::{Client, NoTls};
 use serde_json::Value;
@@ -139,6 +140,24 @@ impl Db {
         serde_json::from_str(comment.strip_prefix("worktreepg ").expect("worktreepg comment")).unwrap()
     }
 
+    /// Waits for every backend on `database` to go away. Dropping a `Client` closes its socket
+    /// without waiting for the backend to exit, and both worktreepg's connection counts and its
+    /// choice between the live database and the template come from `pg_stat_activity`, so a test
+    /// that depends on either has to let the last connection go first.
+    fn wait_idle(&mut self, database: &str) {
+        for _ in 0..100 {
+            // Same boundary Admin::connections draws: an autovacuum worker is not something a
+            // test can wait out, and Postgres terminates one itself rather than refusing a copy.
+            let sql = "SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND backend_type IS DISTINCT FROM 'autovacuum worker' AND pid <> pg_backend_pid()";
+            let row = self.admin.query_one(sql, &[&database]).unwrap();
+            if row.get::<_, i64>(0) == 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("connections to {database} never went away");
+    }
+
     fn things(&self, database: &str) -> Vec<String> {
         self.client(database).query("SELECT name FROM things ORDER BY name", &[]).unwrap().iter().map(|r| r.get(0)).collect()
     }
@@ -155,18 +174,172 @@ fn summary(r: &Run, key: &str) -> u64 {
     r.json["summary"][key].as_u64().unwrap_or_else(|| panic!("summary.{key} missing in {}\n{}", r.stdout, r.stderr))
 }
 
+/// The test cluster, or `None` when there is none and the test should skip.
+fn test_url(test: &str) -> Option<String> {
+    match std::env::var("WORKTREE_PG_TEST_URL") {
+        Ok(url) => Some(url),
+        Err(_) => {
+            eprintln!("skipping {test}: set WORKTREE_PG_TEST_URL (see scripts/test-db.sh)");
+            None
+        }
+    }
+}
+
+/// A repository whose `.worktreeinclude` names `vars` in `.env`, with a source `.env` pointing
+/// all of them at `live_url`. Returns the repository root and that `.env`, which is what
+/// `git worktreeinclude apply` would copy into a new worktree.
+fn fixture(root: &Path, vars: &[&str], live_url: &str) -> (PathBuf, String) {
+    let repo = root.join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&["init", "-q", "-b", "main"], &repo);
+    fs::write(repo.join(".gitignore"), ".env\n.worktreeinclude\n").unwrap();
+    fs::write(repo.join(".worktreeinclude"), format!("# worktreepg: .env {}\n.env\n", vars.join(" "))).unwrap();
+    let mut env: String = vars.iter().map(|v| format!("{v}=\"{live_url}?sslmode=disable\"\n")).collect();
+    env.push_str("OTHER=keep\n");
+    fs::write(repo.join(".env"), &env).unwrap();
+    fs::write(repo.join("README.md"), "app\n").unwrap();
+    git(&["add", "."], &repo);
+    git(&["commit", "-q", "-m", "init"], &repo);
+    (repo, env)
+}
+
+/// An env variable that already points at a third database stops the run before any database is
+/// created, and leaves the file it appears in untouched even where its siblings are rewritable.
+#[test]
+fn an_env_conflict_stops_the_run_before_anything_is_created() {
+    let Some(admin_url) = test_url("an_env_conflict_stops_the_run_before_anything_is_created") else { return };
+    let mut db = Db::connect(&admin_url, "envc");
+    let root = tempfile::tempdir().unwrap();
+    let root: PathBuf = root.path().canonicalize().unwrap();
+    let (repo, source_env) = fixture(&root, &["DATABASE_URL", "DIRECT_URL"], &db.url("envc"));
+
+    let wt = root.join("wt-conflict");
+    git(&["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "conflict"], &repo);
+    let conflicted =
+        format!("DATABASE_URL=\"{}\"\nDIRECT_URL=\"{}?sslmode=disable\"\nOTHER=keep\n", db.url("envc_elsewhere"), db.url("envc"));
+    fs::write(wt.join(".env"), &conflicted).unwrap();
+
+    let r = run(&["apply"], &wt, true);
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    assert_eq!(summary(&r, "conflicts"), 1);
+    assert_eq!(summary(&r, "created"), 0);
+    assert_eq!(summary(&r, "rewritten"), 0);
+    let conflict = r.json["actions"].as_array().unwrap().iter().find(|a| a["op"] == "conflict").unwrap();
+    assert_eq!(conflict["var"], "DATABASE_URL");
+    assert_eq!(conflict["status"], "diff");
+    assert!(!db.exists("envc_conflict"), "no database is created while a variable is in conflict");
+    assert_eq!(fs::read_to_string(wt.join(".env")).unwrap(), conflicted, "DIRECT_URL is rewritable, but the file is left alone");
+
+    // --dry-run reports the same conflict, which is what makes a rehearsal unnecessary
+    let r = run(&["apply", "--dry-run"], &wt, true);
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    assert_eq!(summary(&r, "conflicts"), 1);
+
+    // --force still overrides it, and both variables are then rewritten
+    let r = run(&["apply", "--force"], &wt, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 1);
+    assert_eq!(summary(&r, "rewritten"), 2);
+    assert!(db.exists("envc_conflict"));
+    assert_eq!(fs::read_to_string(wt.join(".env")).unwrap(), source_env.replace(&db.url("envc"), &db.url("envc_conflict")));
+}
+
+/// Two worktree names that normalize to one fork name are a conflict, not one shared database.
+/// Two variables name that database, which is one attempt and so one conflict.
+#[test]
+fn a_fork_belonging_to_another_worktree_is_never_adopted() {
+    let Some(admin_url) = test_url("a_fork_belonging_to_another_worktree_is_never_adopted") else { return };
+    let mut db = Db::connect(&admin_url, "coll");
+    db.client("coll").batch_execute("CREATE TABLE things (name text PRIMARY KEY); INSERT INTO things VALUES ('one')").unwrap();
+    db.wait_idle("coll");
+    let root = tempfile::tempdir().unwrap();
+    let root: PathBuf = root.path().canonicalize().unwrap();
+    let (repo, source_env) = fixture(&root, &["DATABASE_URL", "DIRECT_URL"], &db.url("coll"));
+
+    let dash = root.join("wt-dash");
+    git(&["worktree", "add", "-q", dash.to_str().unwrap(), "-b", "feature/auth-v2"], &repo);
+    fs::write(dash.join(".env"), &source_env).unwrap();
+    let r = run(&["apply"], &dash, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 1);
+    db.client("coll_feature_auth_v2").batch_execute("INSERT INTO things VALUES ('dash')").unwrap();
+
+    // feature/auth.v2 differs from feature/auth-v2 only outside [a-z0-9], so both name one fork
+    let dot = root.join("wt-dot");
+    git(&["worktree", "add", "-q", dot.to_str().unwrap(), "-b", "feature/auth.v2"], &repo);
+    fs::write(dot.join(".env"), &source_env).unwrap();
+    let r = run(&["apply"], &dot, false);
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    assert!(r.stdout.contains(dash.to_str().unwrap()), "the conflict names the worktree that owns the fork: {}", r.stdout);
+    assert!(r.stdout.contains(dot.to_str().unwrap()), "the conflict names this worktree: {}", r.stdout);
+
+    // --recreate does not turn it into permission to drop the other worktree's database
+    let r = run(&["apply", "--recreate"], &dot, true);
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    assert_eq!(summary(&r, "conflicts"), 1, "one database, however many variables name it");
+    assert_eq!(summary(&r, "rewritten"), 0);
+    let conflict = r.json["actions"].as_array().unwrap().iter().find(|a| a["op"] == "conflict").unwrap();
+    assert_eq!(conflict["status"], "other_worktree");
+    assert_eq!(conflict["worktree"], dash.to_str().unwrap(), "the action names the worktree that owns the fork");
+    assert_eq!(db.things("coll_feature_auth_v2"), ["dash", "one"]);
+    assert_eq!(db.meta("coll_feature_auth_v2")["worktree"], dash.to_str().unwrap());
+    assert_eq!(env_database(&dot), "coll");
+}
+
+/// A worktree that moved records a path nothing lives at any more, which is the same mismatch a
+/// second live worktree of a colliding name produces. The fork is refused either way, and the
+/// message names both remedies: moving the worktree back, which keeps the fork, and prune, which
+/// clears the record by dropping the fork.
+#[test]
+fn a_moved_worktree_is_a_conflict_that_names_its_remedies() {
+    let Some(admin_url) = test_url("a_moved_worktree_is_a_conflict_that_names_its_remedies") else { return };
+    let mut db = Db::connect(&admin_url, "movd");
+    db.client("movd").batch_execute("CREATE TABLE things (name text PRIMARY KEY); INSERT INTO things VALUES ('one')").unwrap();
+    db.wait_idle("movd");
+    let root = tempfile::tempdir().unwrap();
+    let root: PathBuf = root.path().canonicalize().unwrap();
+    let (repo, source_env) = fixture(&root, &["DATABASE_URL"], &db.url("movd"));
+
+    let before = root.join("wt-before");
+    git(&["worktree", "add", "-q", before.to_str().unwrap(), "-b", "moved"], &repo);
+    fs::write(before.join(".env"), &source_env).unwrap();
+    let r = run(&["apply"], &before, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 1);
+    db.client("movd_moved").batch_execute("INSERT INTO things VALUES ('two')").unwrap();
+
+    // the branch is what the fork is named after, so the move changes only the recorded path
+    let after = root.join("wt-after");
+    git(&["worktree", "move", before.to_str().unwrap(), after.to_str().unwrap()], &repo);
+    let r = run(&["apply"], &after, false);
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    assert!(r.stdout.contains("moving it back"), "the conflict names the remedy that keeps the data: {}", r.stdout);
+    assert!(r.stdout.contains("git worktreepg prune"), "the conflict names the command that clears the record: {}", r.stdout);
+    assert!(r.stdout.contains("drops the fork"), "and says what prune costs: {}", r.stdout);
+    assert!(r.stdout.contains(before.to_str().unwrap()), "the conflict names the recorded worktree: {}", r.stdout);
+
+    let r = run(&["apply"], &after, true);
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    assert_eq!(summary(&r, "conflicts"), 1);
+    assert_eq!(summary(&r, "rewritten"), 0);
+    let conflict = r.json["actions"].as_array().unwrap().iter().find(|a| a["op"] == "conflict").unwrap();
+    assert_eq!(conflict["status"], "other_worktree", "worktreepg manages this fork for this repository");
+    assert_eq!(db.things("movd_moved"), ["one", "two"], "the refusal leaves the fork's data where it is");
+    assert_eq!(env_database(&after), "movd_moved");
+}
+
 #[test]
 fn end_to_end() {
-    let Ok(admin_url) = std::env::var("WORKTREE_PG_TEST_URL") else {
-        eprintln!("skipping end_to_end: set WORKTREE_PG_TEST_URL (see scripts/test-db.sh)");
-        return;
-    };
+    let Some(admin_url) = test_url("end_to_end") else { return };
     let mut db = Db::connect(&admin_url, "app");
     let live_url = db.url("app");
     let mut live = db.client("app");
     live.batch_execute("CREATE TABLE things (name text PRIMARY KEY); INSERT INTO things VALUES ('one')").unwrap();
-    // closed rather than dropped: the next apply refuses to copy a database anything is connected to
+    // closed rather than dropped: the next apply refuses to copy a database anything is connected
+    // to. close() returns once this end is shut down; wait_idle waits for the backend to leave
+    // pg_stat_activity, which is what worktreepg actually counts.
     live.close().unwrap();
+    db.wait_idle("app");
 
     let root = tempfile::tempdir().unwrap();
     let root: PathBuf = root.path().canonicalize().unwrap();
@@ -222,6 +395,7 @@ fn end_to_end() {
     assert_eq!(summary(&r, "skipped_same"), 1);
 
     // without a template, a live database in use cannot be forked at all
+    db.wait_idle("app");
     {
         let _holder = db.client("app");
         let r = run(&["apply", "--recreate"], &auth, true);
@@ -268,11 +442,23 @@ fn end_to_end() {
     assert_eq!(r.code, 0);
     assert_eq!(summary(&r, "skipped"), 1);
 
+    // a branch whose fork name is the template's is a conflict about the template, not about a
+    // database worktreepg knows nothing of
+    let named = root.join("app-template");
+    git(&["worktree", "add", "-q", named.to_str().unwrap(), "-b", "template"], &repo);
+    fs::write(named.join(".env"), &source_env).unwrap();
+    let r = run(&["apply"], &named, true);
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    let conflict = r.json["actions"].as_array().unwrap().iter().find(|a| a["op"] == "conflict").unwrap();
+    assert_eq!(conflict["status"], "template");
+    git(&["worktree", "remove", "--force", named.to_str().unwrap()], &repo);
+
     // with nothing connected to the live database, apply still clones it directly, and brings
     // the template up to date while it is at it
     let mut live = db.client("app");
     live.batch_execute("INSERT INTO things VALUES ('two')").unwrap();
     live.close().unwrap();
+    db.wait_idle("app");
     let fresh = root.join("app-fresh");
     git(&["worktree", "add", "-q", fresh.to_str().unwrap(), "-b", "fresh"], &repo);
     fs::write(fresh.join(".env"), &source_env).unwrap();
@@ -337,6 +523,7 @@ fn end_to_end() {
     assert!(!db.exists("app_busy"));
 
     // template refresh replaces the snapshot on demand
+    db.wait_idle("app");
     let r = run(&["template", "refresh"], &repo, true);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(summary(&r, "dropped"), 1);
@@ -399,10 +586,7 @@ fn end_to_end() {
 /// privileged and the others are not. Every administrative statement has to run as the first.
 #[test]
 fn mixed_credentials() {
-    let Ok(admin_url) = std::env::var("WORKTREE_PG_TEST_URL") else {
-        eprintln!("skipping mixed_credentials: set WORKTREE_PG_TEST_URL (see scripts/test-db.sh)");
-        return;
-    };
+    let Some(admin_url) = test_url("mixed_credentials") else { return };
     let mut db = Db::connect(&admin_url, "mixed");
     db.role("mixed_runtime");
     // so a run that gets as far as a statement fails on ownership, which is what this test is
@@ -523,10 +707,7 @@ fn mixed_credentials() {
 /// has to be worked as the role in the first URL that names that database.
 #[test]
 fn two_owners_on_one_cluster() {
-    let Ok(admin_url) = std::env::var("WORKTREE_PG_TEST_URL") else {
-        eprintln!("skipping two_owners_on_one_cluster: set WORKTREE_PG_TEST_URL (see scripts/test-db.sh)");
-        return;
-    };
+    let Some(admin_url) = test_url("two_owners_on_one_cluster") else { return };
     let mut db = Db::connect(&admin_url, "owners");
     db.owner_of("owners_ra", "owners_alpha");
     db.owner_of("owners_rb", "owners_beta");

@@ -3,12 +3,12 @@
 
 use crate::db::{self, CopyMethod, ForkOptions, ForkSpec, ForkStatus, Meta, Origin, Pool, TemplateOptions, TemplateStatus};
 use crate::envfile::EnvFile;
-use crate::errors::{environment, is_conflict, usage, EXIT_CONFLICT, EXIT_INTERNAL};
+use crate::errors::{detail_of, environment, is_conflict, usage, EXIT_CONFLICT, EXIT_INTERNAL};
 use crate::git;
 use crate::pgurl::PgUrl;
 use crate::project::{clusters, databases, EnvVar, ProblemKind, Project};
 use crate::report::{Counts, Reporter};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -88,7 +88,8 @@ pub struct ApplyOptions {
 /// Forks the database for the current worktree and points its env file at the fork. Meant to
 /// run from the new worktree right after `git worktreeinclude apply`, which is what puts the
 /// env file there; worktreepg never creates it, because git-worktreeinclude would overwrite
-/// the edit the next time it ran.
+/// the edit the next time it ran. Every decision that does not need the cluster is made first,
+/// in `resolve`, so a run that stops on a conflict has created nothing.
 pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) -> Result<i32> {
     let branch = git::current_branch(&project.target)?;
     let worktree_name = match &opts.worktree_name {
@@ -155,36 +156,26 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
     for v in &vars {
         by_file.entry(&v.file).or_default().push(v);
     }
-    for file in by_file.keys() {
-        if !project.target.join(file).is_file() {
-            return Err(environment(format!(
-                "{file} does not exist in {} yet. Run \"git worktreeinclude apply\" there first; worktreepg only edits env files it finds.",
-                project.target.display()
-            )));
-        }
+
+    let Plan { targets, names, blocked } = resolve(project, &by_file, &worktree_name, opts.force, &mut counts, reporter)?;
+    if blocked {
+        return Ok(finish(&mut counts, reporter));
     }
 
     let mut pool = Pool::new(vars.iter().map(|v| &v.url));
     let clusters = clusters(&vars);
-    // Every outcome, a conflict and an unusable name included, marks the database handled, so a
-    // second variable naming it neither repeats the work nor reports it twice. `forks` holds only
-    // the databases that ended up with a fork, which is what the rewrite below needs.
-    let mut handled: HashSet<String> = HashSet::new();
-    let mut forks: HashMap<String, String> = HashMap::new();
+    let mut tried: HashSet<String> = HashSet::new();
+    let mut forks: HashSet<String> = HashSet::new();
     let mut noted: HashSet<String> = HashSet::new();
     for v in &vars {
         let key = v.url.database_key();
-        if !handled.insert(key.clone()) {
+        // One attempt per database, however many variables name it. `forks` cannot stand in for
+        // this set: a conflict leaves the database out of it, and every later variable naming
+        // that database would try again and report the same conflict.
+        if !tried.insert(key.clone()) {
             continue;
         }
-        let name = match db::fork_name(&v.url.database, &worktree_name) {
-            Ok(name) => name,
-            Err(e) => {
-                counts.inc("errors");
-                reporter.action(json!({ "op": "error", "database": v.url.database, "status": "unnameable" }), format!("error     {e}"));
-                continue;
-            }
-        };
+        let name = names.get(&key).expect("resolve named every database or blocked the run").clone();
         let spec = ForkSpec {
             source: v.url.database.clone(),
             name: name.clone(),
@@ -225,40 +216,39 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
                 counts.inc("skipped_existing");
                 reporter.action(json!({ "op": "create_database", "database": name, "status": "exists" }), format!("exists    {name}"));
             }
+            // A conflict here cannot stop the run the way a conflict in `resolve` does: the forks
+            // for earlier variables already exist, and a fork whose variable was never rewritten
+            // is the orphan this ordering exists to prevent.
             Err(e) if is_conflict(&e) => {
                 counts.inc("conflicts");
-                reporter.action(json!({ "op": "conflict", "database": name, "status": "unmanaged" }), format!("conflict  {name}: {e}"));
+                let mut action = json!({ "op": "conflict", "database": name, "status": "unmanaged" });
+                if let Some(detail) = detail_of(&e) {
+                    action["status"] = json!(detail.status);
+                    for (field, value) in &detail.fields {
+                        action[*field] = value.clone();
+                    }
+                }
+                reporter.action(action, format!("conflict  {name}: {e}"));
                 continue;
             }
             Err(e) => return Err(e),
         }
-        forks.insert(key, name);
+        forks.insert(key);
     }
 
-    for (file, file_vars) in &by_file {
-        let path = project.target.join(file);
-        let mut env = EnvFile::open(&path)?;
-        for v in file_vars {
-            let Some(fork) = forks.get(&v.url.database_key()) else { continue };
-            let current = env.get(&v.name).map(|value| PgUrl::parse(&value).map_or(value, |u| u.database));
-            match current.as_deref() {
-                Some(db) if db == fork => {
-                    counts.inc("skipped_same");
-                    reporter.action(
-                        json!({ "op": "skip", "path": file, "var": v.name, "status": "same" }),
-                        format!("skip      {file} {} (already {fork})", v.name),
-                    );
-                    continue;
-                }
-                Some(db) if db != v.url.database && !opts.force => {
-                    counts.inc("conflicts");
-                    reporter.action(
-                        json!({ "op": "conflict", "path": file, "var": v.name, "status": "diff" }),
-                        format!("conflict  {file} {} points at \"{db}\", not \"{}\" (use --force)", v.name, v.url.database),
-                    );
-                    continue;
-                }
-                _ => {}
+    for Target { file, mut env, vars } in targets {
+        for p in &vars {
+            if !forks.contains(&p.source) {
+                continue;
+            }
+            let (v, fork) = (p.var, &p.fork);
+            if p.same {
+                counts.inc("skipped_same");
+                reporter.action(
+                    json!({ "op": "skip", "path": file, "var": v.name, "status": "same" }),
+                    format!("skip      {file} {} (already {fork})", v.name),
+                );
+                continue;
             }
             env.set(&v.name, &v.url.with_database(fork));
             counts.inc("rewritten");
@@ -272,6 +262,111 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
         }
     }
     Ok(finish(&mut counts, reporter))
+}
+
+/// What one variable's rewrite will be, decided before anything is created and carried to the
+/// rewrite pass, so the file is neither read nor classified a second time.
+struct PlannedVar<'a> {
+    var: &'a EnvVar,
+    /// The variable's live database, keyed as in `Plan::names`: the rewrite is skipped when that
+    /// database's fork turned out to be a conflict.
+    source: String,
+    fork: String,
+    /// The file already names the fork, so there is nothing to write. The fork is still ensured,
+    /// because the database may have been dropped since the last apply.
+    same: bool,
+}
+
+/// A target env file, held open from the pre-flight to the write so the decision for a file and
+/// the write for it cannot disagree. The content is the pre-flight's, and `save` writes all of
+/// it back, so an edit made from outside while the forks are being cloned (roughly a second per
+/// database) is overwritten rather than noticed. Before, that window was only as long as the
+/// rewrite pass.
+struct Target<'a> {
+    file: &'a str,
+    env: EnvFile,
+    vars: Vec<PlannedVar<'a>>,
+}
+
+/// Everything `apply` can settle before it touches the cluster.
+struct Plan<'a> {
+    targets: Vec<Target<'a>>,
+    /// Fork name per live database, keyed by [`PgUrl::database_key`]. Every database the run's
+    /// variables name has an entry unless `blocked`.
+    names: HashMap<String, String>,
+    /// A conflict or an error was reported, so nothing may be created and no file may be written.
+    blocked: bool,
+}
+
+/// Names the fork for every database the run needs and classifies every target variable against
+/// the file it will be rewritten in. Nothing here reaches the cluster: fork names are pure and
+/// the current value is in a file. Whatever this refuses, it refuses while `apply` can still exit
+/// having created nothing, which matters because a fork whose env file was never rewritten is
+/// unreachable: `prune` keeps any fork whose worktree still lives, and no command can name it.
+fn resolve<'a>(
+    project: &Project,
+    by_file: &BTreeMap<&'a str, Vec<&'a EnvVar>>,
+    worktree_name: &str,
+    force: bool,
+    counts: &mut Counts,
+    reporter: &mut Reporter,
+) -> Result<Plan<'a>> {
+    let mut plan = Plan { targets: Vec::new(), names: HashMap::new(), blocked: false };
+    let mut opened = Vec::new();
+    for (&file, file_vars) in by_file {
+        let path = project.target.join(file);
+        if !path.is_file() {
+            return Err(environment(format!(
+                "{file} does not exist in {} yet. Run \"git worktreeinclude apply\" there first; worktreepg only edits env files it finds.",
+                project.target.display()
+            )));
+        }
+        let env = EnvFile::open(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        opened.push((file, file_vars, env));
+    }
+
+    let mut tried: HashSet<String> = HashSet::new();
+    for v in by_file.values().flatten() {
+        let key = v.url.database_key();
+        if !tried.insert(key.clone()) {
+            continue;
+        }
+        match db::fork_name(&v.url.database, worktree_name) {
+            Ok(name) => {
+                plan.names.insert(key, name);
+            }
+            Err(e) => {
+                counts.inc("errors");
+                reporter.action(json!({ "op": "error", "database": v.url.database, "status": "unnameable" }), format!("error     {e}"));
+                plan.blocked = true;
+            }
+        }
+    }
+
+    for (file, file_vars, env) in opened {
+        let mut vars = Vec::new();
+        for v in file_vars {
+            let key = v.url.database_key();
+            let Some(fork) = plan.names.get(&key) else { continue };
+            let current = env.get(&v.name).map(|value| PgUrl::parse(&value).map_or(value, |u| u.database));
+            let same = match current.as_deref() {
+                Some(db) if db == fork => true,
+                Some(db) if db != v.url.database && !force => {
+                    counts.inc("conflicts");
+                    reporter.action(
+                        json!({ "op": "conflict", "path": file, "var": v.name, "status": "diff" }),
+                        format!("conflict  {file} {} points at \"{db}\", not \"{}\" (use --force)", v.name, v.url.database),
+                    );
+                    plan.blocked = true;
+                    continue;
+                }
+                _ => false,
+            };
+            vars.push(PlannedVar { var: v, source: key, fork: fork.clone(), same });
+        }
+        plan.targets.push(Target { file, env, vars });
+    }
+    Ok(plan)
 }
 
 pub struct RemoveOptions {

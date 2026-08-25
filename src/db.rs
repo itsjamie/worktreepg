@@ -10,7 +10,7 @@
 //! (see [`Pool`]). The development database itself is never held open here, so it stays usable
 //! as a `TEMPLATE`.
 
-use crate::errors::{conflict, environment};
+use crate::errors::{conflict, conflict_as, environment};
 use crate::pgurl::PgUrl;
 use crate::storage::{self, Sharing};
 use anyhow::Result;
@@ -18,6 +18,7 @@ use postgres::config::SslMode;
 use postgres::error::SqlState;
 use postgres::{Client, NoTls};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -45,6 +46,9 @@ pub enum Meta {
         source: String,
         /// What the fork was copied from: `source` when nothing was connected to it, else the template.
         template: String,
+        /// Absolute path of the worktree the fork was made for, with symlinks resolved. Every path
+        /// it is compared against comes from `git::canonical`, which resolves them the same way,
+        /// so the comparison is an equality test and not a guess.
         worktree: PathBuf,
         branch: Option<String>,
         created_at: String,
@@ -377,14 +381,37 @@ impl Admin {
     /// Postgres refuses to copy a database that is in use. A fork cloned from the live database
     /// also replaces the template, when there is one, with a copy of itself, so the fallback is
     /// as current as the last fork. Re-running is a no-op. A database of that name that
-    /// worktreepg did not create for this repository is a conflict, with or without `recreate`.
+    /// worktreepg did not create for this repository, or that records a different worktree, is a
+    /// conflict, with or without `recreate`: the recorded worktree may be a live one whose name
+    /// normalizes to the same fork name, and recreating then drops its data.
     pub fn ensure_fork(&mut self, spec: &ForkSpec, opts: ForkOptions) -> Result<ForkStatus> {
         if self.exists(&spec.name)? {
             match self.meta(&spec.name)? {
                 Some(Meta::Template { .. }) => {
-                    return Err(conflict(format!("\"{}\" is a worktreepg template database, not a fork", spec.name)))
+                    return Err(conflict_as(
+                        "template",
+                        Vec::new(),
+                        format!("\"{}\" is a worktreepg template database, not a fork", spec.name),
+                    ))
                 }
-                Some(Meta::Fork { ref repo, .. }) if repo == &spec.repo => {}
+                // The recorded path is only compared here, never followed, so a worktree that has
+                // moved or been removed is indistinguishable from a second live worktree whose
+                // name normalizes the same way. The message names the remedy for each, and what
+                // prune costs: it drops the fork rather than re-pointing it at the new path.
+                Some(Meta::Fork { ref repo, ref worktree, .. }) if repo == &spec.repo => {
+                    if worktree != &spec.worktree {
+                        return Err(conflict_as(
+                            "other_worktree",
+                            vec![("worktree", json!(worktree))],
+                            format!(
+                                "\"{}\" is the fork for worktree {}, not {}. If that worktree moved here, moving it back keeps the fork and its data. \"git worktreepg prune\" clears a record whose worktree is gone, but drops the fork and its data with it, and the next apply makes a fresh one. If both worktrees are live, their names produce the same database name: rename one, or pass --worktree-name.",
+                                spec.name,
+                                worktree.display(),
+                                spec.worktree.display()
+                            ),
+                        ));
+                    }
+                }
                 _ => return Err(conflict("database already exists and was not created by worktreepg for this repository")),
             }
             if !opts.recreate {
