@@ -167,7 +167,51 @@ pub enum Origin {
     /// template exists it was replaced with a copy of the fork, so it is just as current.
     Live { template_refreshed: bool },
     /// The live database was in use, so the fork is a copy of the template, taken at `created_at`.
-    Template { connections: i64, created_at: String },
+    /// From a dry run this is a prediction rather than something Postgres arbitrated, and an
+    /// [`Attached::AtMost`] can predict the template where a real run copies the live database.
+    Template { attached: Attached, created_at: String },
+}
+
+/// What [`Admin::connections`] found attached to a database, and whether the role that looked can
+/// believe the number. `pg_stat_activity` reports `backend_type` as NULL for a session whose role
+/// this one holds neither the privileges of nor those of `pg_read_all_stats`, and the count keeps
+/// a row it cannot identify, so such a row may be an autovacuum worker rather than one of the
+/// app's backends. Masking can only ever inflate the number, never hide a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attached {
+    Exactly(i64),
+    /// No more than this many, and never 0: a row that will not say what it is still counts, so
+    /// a count of zero is exact for every role.
+    AtMost(i64),
+}
+
+impl Attached {
+    /// `masked` is how many of the `n` rows would not say what they were, which is where a worker
+    /// the count means to leave out can hide. Masking is decided per row, so it is measured with
+    /// the count rather than asked of the role: a role is shown the type of every session it
+    /// holds the privileges of, which for a single-role development cluster is all of them.
+    fn counted(n: i64, masked: i64) -> Self {
+        if masked == 0 {
+            Self::Exactly(n)
+        } else {
+            Self::AtMost(n)
+        }
+    }
+
+    /// How many backends are attached, where the role can tell.
+    pub fn count(self) -> Option<i64> {
+        match self {
+            Self::Exactly(n) => Some(n),
+            Self::AtMost(_) => None,
+        }
+    }
+
+    /// The most backends that can be attached, which is what a test for "anything at all" needs.
+    pub fn upper(self) -> i64 {
+        match self {
+            Self::Exactly(n) | Self::AtMost(n) => n,
+        }
+    }
 }
 
 /// How `CREATE DATABASE ... TEMPLATE` copies the template's files.
@@ -230,28 +274,56 @@ struct ExistingTemplate {
 
 enum CopyOutcome {
     Copied,
-    /// The template had this many other backends connected, so Postgres refused.
-    InUse(i64),
+    /// This much was attached to the template, so Postgres refused.
+    InUse(Attached),
 }
 
-/// What is attached to `database`, for the messages about a copy Postgres refused. `connections`
-/// comes from [`Admin::connections`], which does not see everything a copy is refused over, so
-/// zero of them is not the same as nothing being attached.
-pub fn attached(database: &str, connections: i64) -> String {
-    match connections {
-        0 => format!("something is attached to {database} that is not an ordinary connection (a prepared transaction, or a worker Postgres clears itself)"),
-        1 => format!("{database} has 1 open connection"),
-        n => format!("{database} has {n} open connections"),
+/// Whether a message about a database in use reports a copy Postgres refused or one worktreepg
+/// expects it to refuse. A count taken before anything is copied only predicts the refusal, and
+/// an [`Attached::AtMost`] can predict it wrong: an autovacuum worker is a row this role cannot
+/// identify, and not a reason for Postgres to refuse anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Basis {
+    /// Postgres refused the copy.
+    Refused,
+    /// Nothing has been copied, and the count is all worktreepg consulted.
+    Predicted,
+}
+
+/// What is attached to `database`, for the messages about a copy Postgres refused and about one
+/// worktreepg expects it to refuse, `basis` saying which. `attached` comes from
+/// [`Admin::connections`], which does not see everything a copy is refused over, so a count of
+/// zero is not the same as nothing being attached.
+pub fn attached(database: &str, attached: Attached, basis: Basis) -> String {
+    match attached {
+        Attached::Exactly(0) => format!("something is attached to {database} that is not an ordinary connection (a prepared transaction, or a worker Postgres clears itself)"),
+        Attached::Exactly(1) => format!("{database} has 1 open connection"),
+        Attached::Exactly(n) => format!("{database} has {n} open connections"),
+        // The row exists either way. Whether it blocks a copy is the part a prediction cannot
+        // say, since the row may be a worker Postgres clears itself.
+        Attached::AtMost(_) => match basis {
+            Basis::Refused => format!("{database} is in use by something this role cannot identify"),
+            Basis::Predicted => format!("{database} looks to be in use by something this role cannot identify"),
+        },
     }
 }
 
-fn in_use(database: &str, connections: i64) -> anyhow::Error {
-    let remedy = if connections == 0 {
-        "Retrying may be enough; a prepared transaction has to be committed or rolled back first."
-    } else {
-        "Stop the app using it, or re-run with --terminate to close those connections."
+fn in_use(database: &str, attached_to: Attached, basis: Basis) -> anyhow::Error {
+    let remedy = match attached_to {
+        Attached::Exactly(0) => "Retrying may be enough; a prepared transaction has to be committed or rolled back first.",
+        Attached::Exactly(_) => "Stop the app using it, or re-run with --terminate to close those connections.",
+        // Which remedy applies is the part this role cannot see, and --terminate is not offered
+        // plainly: closing a session that belongs to another role needs pg_signal_backend, and
+        // one refusal fails the statement for every backend in it.
+        Attached::AtMost(_) => {
+            "pg_stat_activity says what a session is only to a role holding that session's role's privileges, or those of pg_read_all_stats, so the app and an autovacuum worker look the same here: stop the app using it, or retry, which is enough for a worker Postgres clears itself. Closing another role's connections with --terminate needs membership in pg_signal_backend."
+        }
     };
-    environment(format!("{}, so Postgres will not copy it. {remedy}", attached(database, connections)))
+    let refusal = match basis {
+        Basis::Refused => "so Postgres will not copy it",
+        Basis::Predicted => "so Postgres would not copy it",
+    };
+    environment(format!("{}, {refusal}. {remedy}", attached(database, attached_to, basis)))
 }
 
 impl Admin {
@@ -424,27 +496,31 @@ impl Admin {
 
         let template = self.template_of(&spec.source)?;
         let copy = self.copy;
-        let fallback = |template: Option<ExistingTemplate>, connections: i64| match template {
-            Some(t) => Ok((t.name, Origin::Template { connections, created_at: t.created_at })),
-            None => Err(in_use(&spec.source, connections)),
+        let fallback = |template: Option<ExistingTemplate>, attached: Attached, basis: Basis| match template {
+            Some(t) => Ok((t.name, Origin::Template { attached, created_at: t.created_at })),
+            None => Err(in_use(&spec.source, attached, basis)),
         };
 
         if opts.dry_run {
-            let connections = if opts.terminate { 0 } else { self.connections(&spec.source)? };
-            let (from, origin) = if connections == 0 {
+            // A dry run has to predict what Postgres would arbitrate, since asking it would mean
+            // creating the database. The prediction only asks whether anything is attached, so an
+            // upper bound decides it, and decides it wrong where the bound is all workers: the
+            // messages say the prediction is one, and a real run copies the live database.
+            let attached = if opts.terminate { Attached::Exactly(0) } else { self.connections(&spec.source)? };
+            let (from, origin) = if attached.upper() == 0 {
                 (spec.source.clone(), Origin::Live { template_refreshed: template.is_some() })
             } else {
-                fallback(template, connections)?
+                fallback(template, attached, Basis::Predicted)?
             };
             return Ok(ForkStatus::Forked { from, copy, origin });
         }
 
         let (from, origin) = match self.create_from(&spec.name, &spec.source, opts.terminate)? {
             CopyOutcome::Copied => (spec.source.clone(), Origin::Live { template_refreshed: template.is_some() }),
-            CopyOutcome::InUse(connections) => {
-                let (from, origin) = fallback(template, connections)?;
+            CopyOutcome::InUse(attached) => {
+                let (from, origin) = fallback(template, attached, Basis::Refused)?;
                 if let CopyOutcome::InUse(n) = self.create_from(&spec.name, &from, false)? {
-                    return Err(in_use(&from, n));
+                    return Err(in_use(&from, n, Basis::Refused));
                 }
                 (from, origin)
             }
@@ -486,11 +562,13 @@ impl Admin {
         }
         if exists {
             // The old snapshot is only dropped once the live database looks copyable, so a refresh
-            // that runs into a connected app keeps the snapshot it had.
+            // that runs into a connected app keeps the snapshot it had. A bound is treated as
+            // connections for that reason: refusing a refresh that would have worked keeps the
+            // snapshot, and taking the bound for nothing would drop it before the copy fails.
             if !opts.terminate {
-                let n = self.connections(source)?;
-                if n > 0 {
-                    return Err(in_use(source, n));
+                let attached = self.connections(source)?;
+                if attached.upper() > 0 {
+                    return Err(in_use(source, attached, Basis::Predicted));
                 }
             }
             self.drop_database(&name)?;
@@ -503,7 +581,7 @@ impl Admin {
     /// `source`. `from` is `source` itself or a fresh fork of it.
     fn create_template(&mut self, name: &str, from: &str, source: &str, repo: &Path, terminate: bool) -> Result<()> {
         if let CopyOutcome::InUse(n) = self.create_from(name, from, terminate)? {
-            return Err(in_use(from, n));
+            return Err(in_use(from, n, Basis::Refused));
         }
         self.set_meta(name, &Meta::Template { v: 1, repo: repo.to_path_buf(), source: source.to_string(), created_at: now() })?;
         let sql = format!("ALTER DATABASE {} WITH IS_TEMPLATE true ALLOW_CONNECTIONS false", ident(name));
@@ -529,18 +607,18 @@ impl Admin {
     ///
     /// The number describes the situation rather than reproducing what Postgres tested, and can
     /// be 0 for a database it refused to copy. `pg_stat_activity` shows `backend_type` as NULL
-    /// for sessions of other roles unless this role is a superuser or a member of
-    /// `pg_read_all_stats`, so the exclusion is written NULL-safe: a row that will not say what
-    /// it is counts, which is why the app's own backends are counted at all. A prepared
-    /// transaction, meanwhile, blocks a copy with no row here to count (see [`attached`]).
-    fn connections(&mut self, database: &str) -> Result<i64> {
-        Ok(self
-            .client
-            .query_one(
-                "SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND backend_type IS DISTINCT FROM 'autovacuum worker' AND pid <> pg_backend_pid()",
-                &[&database],
-            )?
-            .get(0))
+    /// for a session this role may not read the statistics of, so the exclusion is written
+    /// NULL-safe: a row that will not say what it is counts, which is why the app's own backends
+    /// are counted at all. Those rows are also where an excluded worker hides, so they are
+    /// counted a second time and the result is a bound rather than a count when there are any
+    /// (see [`Attached`]). A prepared transaction, meanwhile, blocks a copy with no row here to
+    /// count (see [`attached`]).
+    fn connections(&mut self, database: &str) -> Result<Attached> {
+        let row = self.client.query_one(
+            "SELECT count(*) FILTER (WHERE backend_type IS DISTINCT FROM 'autovacuum worker'), count(*) FILTER (WHERE backend_type IS NULL) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+            &[&database],
+        )?;
+        Ok(Attached::counted(row.get(0), row.get(1)))
     }
 
     pub fn drop_template(&mut self, source: &str, opts: TemplateOptions) -> Result<TemplateStatus> {

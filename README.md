@@ -11,6 +11,7 @@ It pairs with [portless](https://github.com/vercel-labs/portless), which already
 - Postgres 13 or newer (for `DROP DATABASE ... WITH (FORCE)`). Tested against Postgres 18.
 - The connecting role needs `CREATEDB`, and must own the development database or be a superuser, which is the normal situation for a local dev cluster. Only one of the URLs naming a database has to: everything done to that database runs as the role in the first directive URL that names it.
 - `--terminate` closes connections that belong to other roles, which owning the database does not allow. That needs membership in `pg_signal_backend`, or a superuser.
+- `pg_read_all_stats` is optional. `pg_stat_activity` tells a role what a session is only where it holds that session's role's privileges, so a session belonging to another role could be your app or could be an autovacuum worker: worktreepg reports the live database as in use without saying by how many connections. The single-role setup, where the app connects as the role the directive URL names, is unaffected. Which database `apply` copies does not change either way, because Postgres decides that and not the count, but a worker parked on the live database makes `template refresh` refuse where a superuser would have refreshed, and `apply --dry-run` name the template where `apply` copies the live database.
 - `git` on `PATH`.
 - Connections are made without TLS. Local clusters are the target; a server that insists on SSL will reject the admin connection.
 
@@ -84,7 +85,7 @@ refresh   app_template (from app, cloned)
 rewrite   .env DATABASE_URL -> app_feature_auth
 ```
 
-With the dev server running, the first line reads `from app_template, cloned, origin=template` instead, and a warning on stderr gives the number of open connections and the snapshot's age. `apply --recreate --terminate` closes those connections and clones the live database after all.
+With the dev server running, the first line reads `from app_template, cloned, origin=template` instead, and a warning on stderr gives the snapshot's age and what is holding the live database, with a count of the open connections where the role can see one. `apply --recreate --terminate` closes those connections and clones the live database after all.
 
 The order matters: `git worktreeinclude apply` is what puts `.env` in the new worktree, and worktreepg only edits env files it finds there. If it created the file itself, git-worktreeinclude would later overwrite it (or report a conflict). Running `apply` before the file exists stops with exit code 4 and nothing is created.
 
@@ -116,7 +117,7 @@ All commands accept `--from auto|<path>`, `--include <path>`, `--json`, `--quiet
 
 - `apply --recreate` drops the worktree's fork and clones it again from current data.
 - `apply --force` rewrites the env variable even when it points at some database other than the source or the fork. Without it that is reported as a conflict (exit code 3), the same way `git worktreeinclude` treats a differing file. The conflict is settled before anything is created, so one such variable stops the whole run: nothing is forked, and nothing is rewritten, in that file or any other.
-- `--terminate` closes open connections to the live database before copying it. Postgres refuses to use a database as a template while anyone is connected, and dev servers keep pools open. Nothing is terminated unless you pass the flag. Without it, `apply` falls back to the snapshot, and `template create|refresh` stop with an error that says how many connections are in the way.
+- `--terminate` closes open connections to the live database before copying it. Postgres refuses to use a database as a template while anyone is connected, and dev servers keep pools open. Nothing is terminated unless you pass the flag. Without it, `apply` falls back to the snapshot, and `template create|refresh` stop with an error that says what is in the way.
 - `remove` connects to every database its directives name before touching anything, so a server that is down stops the command before the worktree is gone; it says so, with `<path> was left in place and no database was dropped`. A directive pointing at a cluster that no longer exists blocks `remove` for that reason until the directive or the env file is fixed. Past the connections, it runs `git worktree remove` first so git's own checks (uncommitted changes, locks) run before any database is dropped. `--force` is passed through to git. `--keep-worktree` only drops the databases.
 - `list --all` includes databases created for other repositories on the same cluster.
 

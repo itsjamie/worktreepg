@@ -19,18 +19,21 @@ fi
 case "${1:-start}" in
   start)
     if ! "$engine" container exists "$name" 2>/dev/null && ! "$engine" inspect "$name" >/dev/null 2>&1; then
-      # autovacuum is off because worktreepg counts connections through pg_stat_activity, which
-      # lists autovacuum workers alongside client backends, and the DDL the tests run attracts
-      # them. The counts the tests assert on are exact. The setting belongs to this throwaway
-      # cluster: the tests never change the configuration of the cluster they are pointed at.
+      # autovacuum is off for what a worker does to the plain owners the tests work as, and the
+      # DDL they run attracts one. DROP DATABASE ... WITH (FORCE) is refused outright while a
+      # worker is attached to the target, because the drop terminates every backend on the
+      # database and a worker belongs to no role such an owner has the privileges of; and
+      # pg_stat_activity masks the worker from that same owner, so a count the tests assert
+      # exactly comes back a bound. The setting belongs to this throwaway cluster: the tests
+      # never change the configuration of the cluster they are pointed at.
       "$engine" run -d --rm --name "$name" -p "127.0.0.1:$port:5432" -e POSTGRES_PASSWORD=pw "$image" -c autovacuum=off >/dev/null
     fi
     for _ in $(seq 1 60); do
       if "$engine" exec "$name" pg_isready -U postgres -q 2>/dev/null; then
-        # A container started before this flag existed keeps the settings it was started with,
-        # and nothing else here would say why the counts flake.
+        # A container started with different settings is reused as it is, and nothing else here
+        # would say why the tests flake.
         if [ "$("$engine" exec "$name" psql -U postgres -tAc 'SHOW autovacuum' 2>/dev/null)" != "off" ]; then
-          echo "warning: $name is running with autovacuum on; run \"$0 stop\" first, or expect flaky connection counts" >&2
+          echo "warning: $name is running with autovacuum on; run \"$0 stop\" first, or expect flaky connection counts and drops" >&2
         fi
         echo "export WORKTREE_PG_TEST_URL=postgres://postgres:pw@127.0.0.1:$port/postgres"
         exit 0

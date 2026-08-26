@@ -198,10 +198,14 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
                         action["origin"] = json!("live");
                         ("live", None)
                     }
-                    Origin::Template { connections, created_at } => {
+                    Origin::Template { attached, created_at } => {
                         let snapshot_age = age(created_at);
                         action["origin"] = json!("template");
-                        action["live_connections"] = json!(connections);
+                        // Only where the role could see a number: a bound would read as a count
+                        // to a caller acting on the field, and there is nothing to act on.
+                        if let Some(connections) = attached.count() {
+                            action["live_connections"] = json!(connections);
+                        }
                         action["snapshot_created_at"] = json!(created_at);
                         action["snapshot_age"] = json!(&snapshot_age);
                         ("template", Some(snapshot_age))
@@ -221,12 +225,17 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
                         );
                     }
                     Origin::Live { template_refreshed: false } => {}
-                    Origin::Template { connections, .. } => reporter.warn(format!(
-                        "{}, so {name} {} a copy of {from}, taken {} ago. For current data, stop the app (or pass --terminate) and run apply --recreate.",
-                        db::attached(&spec.source, connections),
-                        if opts.dry_run { "would be" } else { "is" },
-                        snapshot_age.unwrap_or_default(),
-                    )),
+                    // A real run is here because Postgres refused the live database; a dry run
+                    // because the count says it would, which is a prediction it can get wrong.
+                    Origin::Template { attached, .. } => {
+                        let basis = if opts.dry_run { db::Basis::Predicted } else { db::Basis::Refused };
+                        reporter.warn(format!(
+                            "{}, so {name} {} a copy of {from}, taken {} ago. For current data, stop the app (or pass --terminate) and run apply --recreate.",
+                            db::attached(&spec.source, attached, basis),
+                            if opts.dry_run { "would be" } else { "is" },
+                            snapshot_age.unwrap_or_default(),
+                        ));
+                    }
                 }
             }
             Ok(ForkStatus::Exists) => {

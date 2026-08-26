@@ -25,9 +25,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       # Same reason as scripts/test-db.sh, which passes -c autovacuum=off to the container it
-      # starts: worktreepg counts connections through pg_stat_activity, which lists autovacuum
-      # workers next to client backends, and the tests assert on exact counts. A service
-      # container takes no command arguments, so it is reloaded into the running cluster.
+      # starts: a worker parked on a database gets a plain owner's DROP DATABASE ... WITH (FORCE)
+      # refused, and is masked from that owner in pg_stat_activity, where the tests assert exact
+      # counts. A service container takes no command arguments, so it is reloaded into the
+      # running cluster.
       - name: Stop autovacuum on the test cluster
         run: |
           docker exec ${{ job.services.postgres.id }} \
