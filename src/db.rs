@@ -195,7 +195,9 @@ pub enum Origin {
     /// The live database was in use, so the fork is a copy of the template, taken at `created_at`.
     /// From a dry run this is a prediction rather than something Postgres arbitrated, and an
     /// [`Attached::AtMost`] can predict the template where a real run copies the live database.
-    Template { attached: Attached, created_at: String },
+    /// `signals` says whether `--terminate` was refused on any of what is attached, which is what
+    /// decides whether the flag is worth offering as the way to current data.
+    Template { attached: Attached, created_at: String, signals: Signals },
 }
 
 /// What [`Admin::connections`] found attached to a database, and whether the role that looked can
@@ -302,8 +304,27 @@ struct ExistingTemplate {
 
 enum CopyOutcome {
     Copied,
-    /// This much was attached to the template, so Postgres refused.
-    InUse(Attached),
+    /// This much was attached to the template, so Postgres refused, and this is what `--terminate`
+    /// was allowed to close before it tried.
+    InUse {
+        attached: Attached,
+        signals: Signals,
+    },
+}
+
+/// How `--terminate` fared, which every remedy for a database in use has to know: those remedies
+/// are written around the flag, and offering it to a run it has already been refused for is a
+/// treadmill. How many backends were refused is not carried, because one is as far out of this
+/// role's reach as twenty, and a number from the signalling loop could only contradict the count
+/// the copy's own refusal is reported with (see [`Admin::terminate_backends`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signals {
+    /// Nothing was refused: either the flag was not passed, so nothing was signalled at all, or
+    /// every backend the scan found was closed.
+    Accepted,
+    /// Postgres would not let this role signal at least one backend, so `--terminate` left
+    /// connections behind, and what is still attached may be out of the role's reach entirely.
+    Denied,
 }
 
 /// Whether a message about a database in use reports a copy Postgres refused or one worktreepg
@@ -336,15 +357,28 @@ pub fn attached(database: &str, attached: Attached, basis: Basis) -> String {
     }
 }
 
-fn in_use(database: &str, attached_to: Attached, basis: Basis) -> anyhow::Error {
-    let remedy = match attached_to {
-        Attached::Exactly(0) => "Retrying may be enough; a prepared transaction has to be committed or rolled back first.",
-        Attached::Exactly(_) => "Stop the app using it, or re-run with --terminate to close those connections.",
+fn in_use(database: &str, attached_to: Attached, basis: Basis, signals: Signals) -> anyhow::Error {
+    let remedy = match (attached_to, signals) {
+        // A count of zero keeps its own remedy either way: it is taken after Postgres refused the
+        // copy, and a refused signal is from before it, so a backend that has gone away since is
+        // not what the copy was refused over.
+        (Attached::Exactly(0), _) => {
+            "Retrying may be enough; a prepared transaction has to be committed or rolled back first.".to_string()
+        }
+        // Otherwise a refused signal outranks whatever the count says the remedy is: --terminate
+        // has been tried on this database and Postgres did not let it have all of it, so naming
+        // the flag would be naming the thing that has just failed.
+        (_, Signals::Denied) => {
+            format!("--terminate closed the connections this role can close, and Postgres refused the rest. {}", NEEDS_SIGNAL.advice)
+        }
+        (Attached::Exactly(_), Signals::Accepted) => {
+            "Stop the app using it, or re-run with --terminate to close those connections.".to_string()
+        }
         // Which remedy applies is the part this role cannot see, and --terminate is not offered
-        // plainly: closing a session that belongs to another role needs pg_signal_backend, and
-        // one refusal fails the statement for every backend in it.
-        Attached::AtMost(_) => {
-            "pg_stat_activity says what a session is only to a role holding that session's role's privileges, or those of pg_read_all_stats, so the app and an autovacuum worker look the same here: stop the app using it, or retry, which is enough for a worker Postgres clears itself. Closing another role's connections with --terminate needs membership in pg_signal_backend."
+        // plainly: closing a session that belongs to another role needs pg_signal_backend, so a
+        // row this role cannot identify may be one --terminate would be refused on.
+        (Attached::AtMost(_), Signals::Accepted) => {
+            "pg_stat_activity says what a session is only to a role holding that session's role's privileges, or those of pg_read_all_stats, so the app and an autovacuum worker look the same here: stop the app using it, or retry, which is enough for a worker Postgres clears itself. Closing another role's connections with --terminate needs membership in pg_signal_backend.".to_string()
         }
     };
     let refusal = match basis {
@@ -557,7 +591,7 @@ impl Admin {
                 if template.is_none() && !opts.terminate {
                     let attached = self.connections(&spec.source)?;
                     if attached.upper() > 0 {
-                        return Err(in_use(&spec.source, attached, Basis::Predicted));
+                        return Err(in_use(&spec.source, attached, Basis::Predicted, Signals::Accepted));
                     }
                 }
                 self.drop_database(&spec.name)?;
@@ -565,9 +599,9 @@ impl Admin {
         }
 
         let copy = self.copy;
-        let fallback = |template: Option<ExistingTemplate>, attached: Attached, basis: Basis| match template {
-            Some(t) => Ok((t.name, Origin::Template { attached, created_at: t.created_at })),
-            None => Err(in_use(&spec.source, attached, basis)),
+        let fallback = |template: Option<ExistingTemplate>, attached: Attached, basis: Basis, signals: Signals| match template {
+            Some(t) => Ok((t.name, Origin::Template { attached, created_at: t.created_at, signals })),
+            None => Err(in_use(&spec.source, attached, basis, signals)),
         };
 
         if opts.dry_run {
@@ -575,21 +609,30 @@ impl Admin {
             // creating the database. The prediction only asks whether anything is attached, so an
             // upper bound decides it, and decides it wrong where the bound is all workers: the
             // messages say the prediction is one, and a real run copies the live database.
+            //
+            // Under --terminate the prediction is optimistic instead, and can name the live
+            // database where the real run falls back to the template: every backend is taken for
+            // one the signal closes, and a backend belonging to a role this one may not signal is
+            // not. The only faithful test of a signal is the signal, which a dry run does not
+            // make; predicting from role names would mean reproducing Postgres's rule for who may
+            // signal whom (the backend's own role, or membership in pg_signal_backend, and
+            // neither of those over a superuser's backend) and being wrong in the other direction
+            // when it drifts, which is worse than being optimistic in this one.
             let attached = if opts.terminate { Attached::Exactly(0) } else { self.connections(&spec.source)? };
             let (from, origin) = if attached.upper() == 0 {
                 (spec.source.clone(), Origin::Live { template_refreshed: template.is_some() })
             } else {
-                fallback(template, attached, Basis::Predicted)?
+                fallback(template, attached, Basis::Predicted, Signals::Accepted)?
             };
             return Ok(ForkStatus::Forked { from, copy, origin });
         }
 
         let (from, origin) = match self.create_from(&spec.name, &spec.source, opts.terminate)? {
             CopyOutcome::Copied => (spec.source.clone(), Origin::Live { template_refreshed: template.is_some() }),
-            CopyOutcome::InUse(attached) => {
-                let (from, origin) = fallback(template, attached, Basis::Refused)?;
-                if let CopyOutcome::InUse(n) = self.create_from(&spec.name, &from, false)? {
-                    return Err(in_use(&from, n, Basis::Refused));
+            CopyOutcome::InUse { attached, signals } => {
+                let (from, origin) = fallback(template, attached, Basis::Refused, signals)?;
+                if let CopyOutcome::InUse { attached, signals } = self.create_from(&spec.name, &from, false)? {
+                    return Err(in_use(&from, attached, Basis::Refused, signals));
                 }
                 (from, origin)
             }
@@ -637,7 +680,7 @@ impl Admin {
             if !opts.terminate {
                 let attached = self.connections(source)?;
                 if attached.upper() > 0 {
-                    return Err(in_use(source, attached, Basis::Predicted));
+                    return Err(in_use(source, attached, Basis::Predicted, Signals::Accepted));
                 }
             }
             self.drop_database(&name)?;
@@ -649,8 +692,8 @@ impl Admin {
     /// Creates `name` as a copy of `from`, tagged and flagged as the template snapshotted from
     /// `source`. `from` is `source` itself or a fresh fork of it.
     fn create_template(&mut self, name: &str, from: &str, source: &str, repo: &Path, terminate: bool) -> Result<()> {
-        if let CopyOutcome::InUse(n) = self.create_from(name, from, terminate)? {
-            return Err(in_use(from, n, Basis::Refused));
+        if let CopyOutcome::InUse { attached, signals } = self.create_from(name, from, terminate)? {
+            return Err(in_use(from, attached, Basis::Refused, signals));
         }
         self.set_meta(name, &Meta::Template { v: 1, repo: repo.to_path_buf(), source: source.to_string(), created_at: now() })?;
         let sql = format!("ALTER DATABASE {} WITH IS_TEMPLATE true ALLOW_CONNECTIONS false", ident(name));
@@ -744,16 +787,7 @@ impl Admin {
     /// `CREATE DATABASE name TEMPLATE template`. Postgres checks for other backends in the
     /// template before it copies anything, so an in-use outcome has created nothing.
     fn create_from(&mut self, name: &str, template: &str, terminate: bool) -> Result<CopyOutcome> {
-        if terminate {
-            // Autovacuum workers are left alone, the way connections() does not count them:
-            // Postgres clears them itself, and one signal Postgres refuses fails the statement for
-            // every backend in it. A role pg_stat_activity masks the view for cannot tell a worker
-            // apart, so this spares only the roles that could have signalled one.
-            let sql = "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND backend_type IS DISTINCT FROM 'autovacuum worker' AND pid <> pg_backend_pid()";
-            self.client
-                .execute(sql, &[&template])
-                .map_err(|e| self.refused(&format!("closing connections to {template}"), NEEDS_SIGNAL, e))?;
-        }
+        let signals = if terminate { self.terminate_backends(template)? } else { Signals::Accepted };
         let strategy = match self.copy {
             CopyMethod::WalLog => "",
             CopyMethod::Clone => " STRATEGY = FILE_COPY",
@@ -761,9 +795,80 @@ impl Admin {
         let sql = format!("CREATE DATABASE {} TEMPLATE {}{strategy}", ident(name), ident(template));
         match self.client.batch_execute(&sql) {
             Ok(()) => Ok(CopyOutcome::Copied),
-            Err(e) if e.code() == Some(&SqlState::OBJECT_IN_USE) => Ok(CopyOutcome::InUse(self.connections(template)?)),
+            Err(e) if e.code() == Some(&SqlState::OBJECT_IN_USE) => {
+                Ok(CopyOutcome::InUse { attached: self.connections(template)?, signals })
+            }
             Err(e) => Err(self.refused(&format!("creating database {name}"), NEEDS_OWNERSHIP, e)),
         }
+    }
+
+    /// Closes what is attached to `database`, one statement per backend, so a backend this role
+    /// may not signal costs that backend and no other. Over a set, `pg_terminate_backend` stops at
+    /// the first backend Postgres will not signal, and the rows the scan had not reached yet are
+    /// never signalled at all, which leaves their order in `pg_stat_activity` deciding what
+    /// `--terminate` closed.
+    ///
+    /// Autovacuum workers are left out, the way [`Admin::connections`] does not count them:
+    /// Postgres clears them itself rather than refusing the copy. A role `pg_stat_activity` masks
+    /// the view for cannot tell a worker apart, so the filter spares only the roles that could
+    /// have signalled one, and for every other role the worker is a refusal like any other.
+    ///
+    /// Being incomplete is the point rather than a failure, so a refusal is swallowed rather than
+    /// returned: what survived is arbitrated by the `CREATE DATABASE` that follows, over what is
+    /// attached when it runs, which is a later and truer account than a signal refused a moment
+    /// before, and one that already carries its own message (see [`in_use`]). That a signal was
+    /// refused is returned, because those messages are written around `--terminate` and must not
+    /// offer it to a run it has already been refused for. Anything other than a refusal, a server
+    /// that goes away mid-loop, still fails the command.
+    fn terminate_backends(&mut self, database: &str) -> Result<Signals> {
+        let sql = "SELECT pid FROM pg_stat_activity WHERE datname = $1 AND backend_type IS DISTINCT FROM 'autovacuum worker' AND pid <> pg_backend_pid()";
+        let pids: Vec<i32> = self.client.query(sql, &[&database])?.iter().map(|row| row.get(0)).collect();
+        if pids.is_empty() {
+            // Nothing to signal, so the privilege the loop needs is not one this copy needs: an
+            // idle database is no place to fail a run over a grant it was never going to use.
+            return Ok(Signals::Accepted);
+        }
+        self.may_terminate(database)?;
+        let mut signals = Signals::Accepted;
+        for pid in pids {
+            // A backend that went away between the scan and the signal is not an error:
+            // pg_terminate_backend warns and returns false for a pid that is no longer there.
+            match self.client.execute("SELECT pg_terminate_backend($1)", &[&pid]) {
+                Ok(_) => {}
+                Err(e) if e.code() == Some(&SqlState::INSUFFICIENT_PRIVILEGE) => signals = Signals::Denied,
+                Err(e) => return Err(anyhow::Error::new(e).context(format!("closing connections to {database}"))),
+            }
+        }
+        Ok(signals)
+    }
+
+    /// Fails when this role may not execute `pg_terminate_backend` at all, which the signalling
+    /// loop above cannot tell from the refusal it is written to survive: Postgres refuses "this
+    /// backend belongs to a role you may not signal" and "you may not call this function" with
+    /// the same `INSUFFICIENT_PRIVILEGE`, and swallowing the second would make `--terminate` a
+    /// silent no-op on a cluster where `EXECUTE` has been revoked from `PUBLIC`.
+    ///
+    /// The two-argument signature is the one Postgres 14 and newer carry, and it is asked for by
+    /// name rather than by oid so a server that has no such function says so. A question the
+    /// server will not answer leaves the loop to find out for itself, the way it did before this
+    /// check existed: the flag works on far more clusters than it is revoked on, and a check that
+    /// cannot be made is no reason to refuse to try.
+    fn may_terminate(&mut self, database: &str) -> Result<()> {
+        let sql = "SELECT has_function_privilege(current_user, 'pg_terminate_backend(integer, bigint)', 'EXECUTE')";
+        let granted = self.client.query_one(sql, &[]).ok().and_then(|row| row.get::<_, Option<bool>>(0));
+        if granted != Some(false) {
+            return Ok(());
+        }
+        Err(environment_as(
+            NEEDS_SIGNAL.status,
+            vec![("role", json!(self.role))],
+            format!(
+                "closing connections to {database}{} on {}: EXECUTE on pg_terminate_backend has been revoked from this role, so --terminate can close nothing. Granting it back (GRANT EXECUTE ON FUNCTION pg_terminate_backend(integer, bigint) TO \"{}\") restores the flag; stopping whatever is connected needs no grant at all.",
+                as_role(&self.role),
+                self.server,
+                self.role
+            ),
+        ))
     }
 
     fn set_meta(&mut self, name: &str, meta: &Meta) -> Result<()> {

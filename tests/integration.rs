@@ -159,6 +159,13 @@ impl Db {
         panic!("connections to {database} never went away");
     }
 
+    /// The backends `--terminate` signals, in the order it signals them, which is the scan
+    /// [`worktreepg::db`] makes before the loop.
+    fn scan(&mut self, database: &str) -> Vec<i32> {
+        let sql = "SELECT pid FROM pg_stat_activity WHERE datname = $1 AND backend_type IS DISTINCT FROM 'autovacuum worker' AND pid <> pg_backend_pid()";
+        self.admin.query(sql, &[&database]).unwrap().iter().map(|r| r.get(0)).collect()
+    }
+
     fn things(&self, database: &str) -> Vec<String> {
         self.client(database).query("SELECT name FROM things ORDER BY name", &[]).unwrap().iter().map(|r| r.get(0)).collect()
     }
@@ -336,6 +343,126 @@ fn a_moved_worktree_is_a_conflict_that_names_its_remedies() {
     assert_eq!(conflict["status"], "other_worktree", "worktreepg manages this fork for this repository");
     assert_eq!(db.things("movd_moved"), ["one", "two"], "the refusal leaves the fork's data where it is");
     assert_eq!(env_database(&after), "movd_moved");
+}
+
+fn backend_pid(client: &mut Client) -> i32 {
+    client.query_one("SELECT pg_backend_pid()", &[]).unwrap().get(0)
+}
+
+/// A connection to `url` that the scan `--terminate` makes reaches after `first`, the backend the
+/// signal is refused on. A refusal that stopped the scan costs the backends after it and no
+/// others, so a test that a refusal costs nothing but itself is only testing anything where there
+/// is one to lose: the order is asserted here rather than left to how the cluster hands out
+/// backend slots. It hands them out in connection order, so connecting after `first` is normally
+/// enough; a slot another test freed is handed out again ahead of it, and a candidate that lands
+/// there is kept rather than dropped, because holding the slot is what makes the next candidate
+/// land later where dropping it would hand the same slot back.
+fn attached_after(db: &mut Db, database: &str, url: &str, first: i32) -> Client {
+    let mut held = Vec::new();
+    for _ in 0..20 {
+        let mut candidate = Client::connect(url, NoTls).unwrap();
+        let pid = backend_pid(&mut candidate);
+        let scan = db.scan(database);
+        let at = |p: i32| scan.iter().position(|q| *q == p).unwrap_or_else(|| panic!("pid {p} is not in the scan of {database}"));
+        if at(first) < at(pid) {
+            return candidate;
+        }
+        held.push(candidate);
+    }
+    panic!("no connection to {database} landed after pid {first} in the scan --terminate makes");
+}
+
+/// `--terminate` closes the backends the role can close even where another backend on the same
+/// database belongs to a role it may not signal. Signalling a set stops at the first refusal, and
+/// the rows the scan had not reached are never signalled, so one such backend cost some or all of
+/// the others depending on where it fell in `pg_stat_activity`, and the run failed over a backend
+/// the developer never started either way. An autovacuum worker is that case on an ordinary
+/// cluster; a superuser session is the same refusal without the timing.
+///
+/// Which backend survives is what the order decides, so the refusal reported is what pins this:
+/// the copy's, over what is still attached, rather than the signal's. What the refusal costs is
+/// pinned by the order too, so the backend that survives the signal is put ahead of the one that
+/// does not rather than being left where the cluster puts it.
+///
+/// A run that was refused is never told to try `--terminate`, whether the refusal ends the run or
+/// only sends it to the snapshot: it has just done that.
+#[test]
+fn terminate_closes_what_the_role_can_close() {
+    let Some(admin_url) = test_url("terminate_closes_what_the_role_can_close") else { return };
+    let mut db = Db::connect(&admin_url, "term");
+    db.owner_of("term_ra", "term_alpha");
+    let alpha_url = db.url_as("term_ra", "term_alpha");
+    // as the owner, so the same role can write to it from the session --terminate closes below
+    Client::connect(&alpha_url, NoTls)
+        .unwrap()
+        .batch_execute("CREATE TABLE things (name text PRIMARY KEY); INSERT INTO things VALUES ('one')")
+        .unwrap();
+    db.wait_idle("term_alpha");
+
+    let root = tempfile::tempdir().unwrap();
+    let root: PathBuf = root.path().canonicalize().unwrap();
+    let (repo, source_env) = fixture(&root, &["DATABASE_URL"], &alpha_url);
+
+    let work = root.join("term-work");
+    git(&["worktree", "add", "-q", work.to_str().unwrap(), "-b", "work"], &repo);
+    fs::write(work.join(".env"), &source_env).unwrap();
+
+    {
+        let mut superuser = db.client("term_alpha");
+        let refused = backend_pid(&mut superuser);
+        let mut app = attached_after(&mut db, "term_alpha", &alpha_url, refused);
+        let r = run(&["apply", "--terminate"], &work, true);
+        assert_eq!(r.code, 4, "{}", r.stderr);
+        // There is no template to fall back on, so the copy Postgres refused is the whole run.
+        // The refusal it reports is the copy's, over what is still attached, and not the signal's:
+        // being incomplete is what --terminate is allowed to be.
+        let failure = message(&r, "error");
+        assert!(failure.contains("term_alpha is in use by something this role cannot identify"), "{failure}");
+        assert!(!failure.contains("permission denied to terminate"), "one refusal is that backend's alone: {failure}");
+        // What the run could not close is what the remedy is written around: the flag has been
+        // tried, so it is not offered again, and what it wanted is named instead.
+        assert!(failure.contains("--terminate closed the connections this role can close"), "{failure}");
+        assert!(failure.contains("pg_signal_backend"), "{failure}");
+        assert!(!failure.contains("re-run with --terminate"), "the flag was just refused: {failure}");
+        assert!(app.batch_execute("SELECT 1").is_err(), "the backend this role can signal was closed");
+        assert!(superuser.batch_execute("SELECT 1").is_ok(), "the one it cannot signal was left alone");
+        assert!(!db.exists("term_alpha_work"), "Postgres refused the copy, so nothing was created");
+    }
+
+    // and with nothing attached that this role cannot signal, the copy goes through
+    db.wait_idle("term_alpha");
+    {
+        let mut app = Client::connect(&alpha_url, NoTls).unwrap();
+        app.batch_execute("INSERT INTO things VALUES ('two')").unwrap();
+        let r = run(&["apply", "--terminate"], &work, true);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert_eq!(summary(&r, "created"), 1);
+        assert!(app.batch_execute("SELECT 1").is_err(), "the app's connection was closed");
+    }
+    assert_eq!(db.things("term_alpha_work"), ["one", "two"], "the fork is a copy of the live database");
+
+    // With a snapshot to fall back on, the same refusal is a warning rather than a failed run,
+    // and it says the same thing: the flag it would have offered is the one Postgres refused.
+    db.wait_idle("term_alpha");
+    let r = run(&["template", "create"], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    {
+        let mut superuser = db.client("term_alpha");
+        superuser.batch_execute("INSERT INTO things VALUES ('three')").unwrap();
+        let r = run(&["apply", "--recreate", "--terminate"], &work, false);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert!(r.stdout.contains(", origin=template)"), "{}", r.stdout);
+        assert!(r.stderr.contains("--terminate closed the connections this role can close"), "{}", r.stderr);
+        assert!(r.stderr.contains("pg_signal_backend"), "{}", r.stderr);
+        assert!(!r.stderr.contains("pass --terminate"), "the flag was just refused: {}", r.stderr);
+    }
+    assert_eq!(db.things("term_alpha_work"), ["one", "two"], "the fork is the snapshot, without the row added since");
+
+    for name in ["term_alpha_work", "term_alpha_template", "term_alpha", "term"] {
+        db.admin.batch_execute(&format!("ALTER DATABASE \"{name}\" WITH IS_TEMPLATE false")).ok();
+        db.admin.batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)")).unwrap();
+    }
+    db.drop_role("term_ra");
 }
 
 /// Same credentials and database as `url`, but a port nothing listens on, so connecting fails

@@ -335,7 +335,7 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
                         action["origin"] = json!("live");
                         ("live", None)
                     }
-                    Origin::Template { attached, created_at } => {
+                    Origin::Template { attached, created_at, .. } => {
                         let snapshot_age = age(created_at);
                         action["origin"] = json!("template");
                         // Only where the role could see a number: a bound would read as a count
@@ -364,10 +364,18 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
                     Origin::Live { template_refreshed: false } => {}
                     // A real run is here because Postgres refused the live database; a dry run
                     // because the count says it would, which is a prediction it can get wrong.
-                    Origin::Template { attached, .. } => {
+                    Origin::Template { attached, signals, .. } => {
                         let basis = if opts.dry_run { db::Basis::Predicted } else { db::Basis::Refused };
+                        let remedy = match signals {
+                            // This run passed --terminate and Postgres refused it on part of what
+                            // was attached, so offering the flag would be offering what has just
+                            // failed. What is left needs a membership the run has already been
+                            // told it lacks, and stopping it needs nothing at all.
+                            db::Signals::Denied => "--terminate closed the connections this role can close, and Postgres refused the rest: closing another role's connections needs membership in pg_signal_backend, or superuser, and stopping whatever is connected needs neither. For current data, stop it and run apply --recreate.",
+                            db::Signals::Accepted => "For current data, stop the app (or pass --terminate) and run apply --recreate.",
+                        };
                         reporter.warn(format!(
-                            "{}, so {name} {} a copy of {from}, taken {} ago. For current data, stop the app (or pass --terminate) and run apply --recreate.",
+                            "{}, so {name} {} a copy of {from}, taken {} ago. {remedy}",
                             db::attached(&spec.source, attached, basis),
                             if opts.dry_run { "would be" } else { "is" },
                             snapshot_age.unwrap_or_default(),
