@@ -1,9 +1,9 @@
 //! The five commands. Each one works in terms of forks, templates, and worktrees; the SQL,
 //! metadata, and file-format details live in `db`, `envfile`, and `project`.
 
-use crate::db::{self, CopyMethod, ForkOptions, ForkSpec, ForkStatus, Meta, Origin, Pool, TemplateOptions, TemplateStatus};
+use crate::db::{self, CopyMethod, ForkOptions, ForkSpec, ForkStatus, Managed, Meta, Origin, Pool, TemplateOptions, TemplateStatus};
 use crate::envfile::EnvFile;
-use crate::errors::{annotated, detail_of, environment, exit_code, is_conflict, usage, EXIT_CONFLICT, EXIT_INTERNAL};
+use crate::errors::{annotated, detail_of, environment, exit_code, is_conflict, usage, EXIT_CONFLICT, EXIT_ENVIRONMENT, EXIT_INTERNAL};
 use crate::git;
 use crate::pgurl::PgUrl;
 use crate::project::{clusters, databases, EnvVar, ProblemKind, Project};
@@ -53,13 +53,110 @@ fn age(timestamp: &str) -> String {
     format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
-/// The connection that drops a fork of `source`, which a scan turned up: the credentials of the
-/// first directive URL that names `source` on this cluster. A fork whose source database the
-/// directives no longer name falls back to the cluster's first URL, which is all that is left to
-/// try, and the work is still scoped to `source` rather than to whatever that URL names.
-fn dropper<'a>(pool: &'a mut Pool, live: &[PgUrl], cluster: &PgUrl, source: &str) -> Result<&'a mut db::Admin> {
-    let url = live.iter().find(|u| u.cluster_key == cluster.cluster_key && u.database == source).unwrap_or(cluster);
-    pool.for_database(url, source)
+/// Which URL a fork of `source` is dropped on: the first directive URL that names `source` on this
+/// cluster, so first-seen-wins holds wherever the source is still named, else the cluster's own
+/// first URL, which is all that is left to try. The work stays scoped to `source` rather than to
+/// whatever the chosen URL names.
+fn dropper<'a>(live: &'a [PgUrl], cluster: &'a PgUrl, source: &str) -> &'a PgUrl {
+    live.iter().find(|u| u.cluster_key == cluster.cluster_key && u.database == source).unwrap_or(cluster)
+}
+
+/// A URL on the cluster that connects as `owner`, for the second attempt at a drop the first role
+/// was refused. The role that owns a fork is reached this way wherever any directive offers it,
+/// including through a URL naming some other database that role owns, which is what a fork whose
+/// own source is no longer named has left.
+fn owners_url<'a>(live: &'a [PgUrl], cluster: &PgUrl, tried: &PgUrl, owner: &str) -> Option<&'a PgUrl> {
+    live.iter().find(|u| u.cluster_key == cluster.cluster_key && u.user == owner && u.role_key() != tried.role_key())
+}
+
+/// What puts a fork's drop back within reach of a role that can do it. Only ownership does, and a
+/// URL naming the fork's source database is the one that usually carries the owning role, which is
+/// why the source is named as an example rather than as the remedy itself.
+fn restore_a_directive(source: &str, owner: Option<&str>) -> String {
+    match owner {
+        Some(owner) => format!(
+            "List a directive URL on this cluster that connects as \"{owner}\", such as the one for \"{source}\", and \"git worktreepg prune\" drops it."
+        ),
+        None => format!("List a directive URL naming \"{source}\", and \"git worktreepg prune\" drops it."),
+    }
+}
+
+/// Drops the fork, as the first role and then as the one that owns it where a URL on the cluster
+/// connects as that role and the first was refused for want of ownership. Returns the refusal to
+/// report, or `None` where the fork was dropped.
+fn attempt_drop(pool: &mut Pool, source: &str, name: &str, first: &PgUrl, owning: Option<&PgUrl>) -> Result<Option<anyhow::Error>> {
+    let mut refusal = None;
+    for url in [Some(first), owning].into_iter().flatten() {
+        match pool.for_database(url, source)?.drop_fork(name, false) {
+            Ok(()) => return Ok(None),
+            Err(e) if is_not_owner(&e) => refusal = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(refusal.expect("the first URL was attempted")))
+}
+
+/// Whether the server refused a statement because the role does not own the database, which is the
+/// one refusal a drop has somewhere else to try after, and can carry on past.
+fn is_not_owner(e: &anyhow::Error) -> bool {
+    detail_of(e).is_some_and(|d| d.status == db::NOT_OWNER)
+}
+
+/// Drops one fork a cluster scan turned up, counting it. A drop refused for want of ownership by
+/// every role the directives offer is counted as a skip and reported with the remedy, rather than
+/// failing the command: a fork nothing can drop fails every later run the same way, which leaves
+/// it unreachable by any command, so the run finishes the rest of its work and reports the one
+/// piece it could not do. Returns whether the fork was dropped, because the two callers describe
+/// that in their own words.
+fn drop_scanned(
+    pool: &mut Pool,
+    live: &[PgUrl],
+    cluster: &PgUrl,
+    fork: &Managed,
+    dry_run: bool,
+    counts: &mut Counts,
+    reporter: &mut Reporter,
+) -> Result<bool> {
+    let source = fork.meta.source();
+    let first = dropper(live, cluster, source);
+    let owner = pool.for_cluster(cluster)?.owner_of(&fork.name)?;
+    let owning = owner.as_deref().and_then(|owner| owners_url(live, cluster, first, owner));
+
+    let refused = if dry_run {
+        let admin = pool.for_database(first, source)?;
+        // A dry run runs no statement, so the refusal it would meet is asked for instead. It only
+        // stands where no URL on the cluster connects as the owning role either, since that one is
+        // what a real run falls back to.
+        match (&owner, &owning) {
+            (Some(owner), None) => admin.drop_refusal(&fork.name, owner)?,
+            _ => None,
+        }
+    } else {
+        attempt_drop(pool, source, &fork.name, first, owning)?
+    };
+    let Some(e) = refused else {
+        counts.inc("dropped");
+        return Ok(true);
+    };
+
+    counts.inc("skipped");
+    let mut action = json!({
+        "op": "skip",
+        "database": fork.name,
+        "worktree": fork.meta.worktree(),
+        "source": source,
+        "owner": owner,
+        "status": db::NOT_OWNER,
+        "predicted": dry_run,
+    });
+    if let Some(detail) = detail_of(&e) {
+        for (field, value) in &detail.fields {
+            action[*field] = value.clone();
+        }
+    }
+    let line = format!("skip      {}{}: {e} {}", fork.name, planned(dry_run), restore_a_directive(source, owner.as_deref()));
+    reporter.action_or_warn(action, line);
+    Ok(false)
 }
 
 /// The `--verbose` line about what a fork will cost on disk, once per cluster, taken on the first
@@ -500,7 +597,11 @@ pub struct RemoveOptions {
 /// directive naming a cluster that is gone for good blocks `remove` until the directive or the
 /// env file is fixed. Git's own checks (uncommitted changes, locks) still run, and the
 /// worktree still goes, before any database is dropped; a fork left behind by a failure past
-/// that point is picked up by `prune`.
+/// that point is picked up by `prune`. A fork none of the roles the directives offer owns is
+/// reported as a skip and the rest are still dropped: a fork nothing can drop fails every later
+/// run the same way, which leaves it unreachable by any command, so the run finishes the work it
+/// can do and reports the one piece it could not. It exits 4 having skipped one, and a
+/// `--dry-run` that predicts a skip reports and exits the same way.
 pub fn remove(project: &Project, opts: &RemoveOptions, reporter: &mut Reporter) -> Result<i32> {
     project.require_directives()?;
     let target = git::canonical(&project.cwd.join(opts.path.as_deref().unwrap_or(".")));
@@ -508,7 +609,7 @@ pub fn remove(project: &Project, opts: &RemoveOptions, reporter: &mut Reporter) 
         return Err(usage(format!("{} is the source worktree; refusing to remove it", target.display())));
     }
     let registered = git::living_worktrees(&project.cwd)?.contains(&target);
-    let mut counts = Counts::new(&["worktree_removed", "dropped"]);
+    let mut counts = Counts::new(&["worktree_removed", "dropped", "skipped"]);
     let doc = document(vec![("dry_run", json!(opts.dry_run)), ("worktree", json!(target))]);
 
     // Every database the directives name, not only the ones holding a fork of this worktree:
@@ -540,23 +641,25 @@ pub fn remove(project: &Project, opts: &RemoveOptions, reporter: &mut Reporter) 
             if worktree != &target {
                 continue;
             }
-            dropper(&mut pool, &live, cluster, fork.meta.source())?.drop_fork(&fork.name, opts.dry_run)?;
-            counts.inc("dropped");
-            reporter.action(
-                json!({ "op": "drop_database", "database": fork.name, "worktree": worktree, "status": status(opts.dry_run) }),
-                format!("drop      {}{}", fork.name, planned(opts.dry_run)),
-            );
+            if drop_scanned(&mut pool, &live, cluster, &fork, opts.dry_run, &mut counts, reporter)? {
+                reporter.action(
+                    json!({ "op": "drop_database", "database": fork.name, "worktree": worktree, "status": status(opts.dry_run) }),
+                    format!("drop      {}{}", fork.name, planned(opts.dry_run)),
+                );
+            }
         }
     }
     reporter.finish(doc, &counts);
-    Ok(0)
+    Ok(if counts.get("skipped") > 0 { EXIT_ENVIRONMENT } else { 0 })
 }
 
-/// Drops every fork whose worktree git no longer lists: the catch-up after a plain `git worktree remove`.
+/// Drops every fork whose worktree git no longer lists: the catch-up after a plain `git worktree
+/// remove`, and the way back for a fork an earlier `remove` had to skip. One it still cannot drop
+/// is skipped again rather than stopping the run, so the forks after it are not held up by it.
 pub fn prune(project: &Project, dry_run: bool, reporter: &mut Reporter) -> Result<i32> {
     project.require_directives()?;
     let living: HashSet<PathBuf> = git::living_worktrees(&project.cwd)?.into_iter().collect();
-    let mut counts = Counts::new(&["forks", "dropped", "kept"]);
+    let mut counts = Counts::new(&["forks", "dropped", "kept", "skipped"]);
     let (vars, problems) = project.env_vars()?;
     warn_all(&problems, reporter);
     let mut pool = Pool::new(vars.iter().map(|v| &v.url));
@@ -570,16 +673,16 @@ pub fn prune(project: &Project, dry_run: bool, reporter: &mut Reporter) -> Resul
                 reporter.verbose(format!("keep      {} ({})", fork.name, worktree.display()));
                 continue;
             }
-            dropper(&mut pool, &live, cluster, fork.meta.source())?.drop_fork(&fork.name, dry_run)?;
-            counts.inc("dropped");
-            reporter.action(
-                json!({ "op": "drop_database", "database": fork.name, "worktree": worktree, "status": status(dry_run) }),
-                format!("drop      {} (worktree {} is gone{})", fork.name, worktree.display(), if dry_run { ", planned" } else { "" }),
-            );
+            if drop_scanned(&mut pool, &live, cluster, &fork, dry_run, &mut counts, reporter)? {
+                reporter.action(
+                    json!({ "op": "drop_database", "database": fork.name, "worktree": worktree, "status": status(dry_run) }),
+                    format!("drop      {} (worktree {} is gone{})", fork.name, worktree.display(), if dry_run { ", planned" } else { "" }),
+                );
+            }
         }
     }
     reporter.finish(document(vec![("dry_run", json!(dry_run))]), &counts);
-    Ok(0)
+    Ok(if counts.get("skipped") > 0 { EXIT_ENVIRONMENT } else { 0 })
 }
 
 /// Shows the template and forks on each cluster, and whether each fork's worktree still exists.

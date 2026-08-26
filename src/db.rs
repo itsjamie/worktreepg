@@ -10,7 +10,7 @@
 //! (see [`Pool`]). The development database itself is never held open here, so it stays usable
 //! as a `TEMPLATE`.
 
-use crate::errors::{conflict, conflict_as, environment};
+use crate::errors::{conflict, conflict_as, environment, environment_as};
 use crate::pgurl::PgUrl;
 use crate::storage::{self, Sharing};
 use anyhow::Result;
@@ -27,12 +27,29 @@ pub const META_PREFIX: &str = "worktreepg ";
 /// Postgres NAMEDATALEN is 64, so identifiers are at most 63 bytes.
 const MAX_IDENTIFIER: usize = 63;
 
-/// What a role lacks when Postgres refuses a statement. Everything worktreepg runs is ownership
-/// work, except closing someone else's connections: signalling another role's backend is a role
-/// membership of its own, which owning the database does not carry.
-const NEEDS_OWNERSHIP: &str = "That role needs CREATEDB and has to own the database, or be a superuser.";
-const NEEDS_SIGNAL: &str =
-    "Closing another role's connections needs membership in pg_signal_backend, or superuser; owning the database does not confer it.";
+/// The status [`Admin::refused`] gives a statement Postgres refused because the role does not own
+/// the database. A caller that has somewhere else to try, or something to say about what would
+/// make it work, tells that refusal apart from every other environment error by this.
+pub const NOT_OWNER: &str = "not_owner";
+
+/// What a role lacks when Postgres refuses a statement, and the status the refusal is reported
+/// under. Everything worktreepg runs is ownership work, except closing someone else's
+/// connections: signalling another role's backend is a role membership of its own, which owning
+/// the database does not carry. A `DROP DATABASE ... WITH (FORCE)` asks for both, so which of the
+/// two it was refused over is decided per failure (see [`Admin::drop_database`]).
+#[derive(Clone, Copy)]
+struct Refusal {
+    status: &'static str,
+    advice: &'static str,
+}
+
+const NEEDS_OWNERSHIP: Refusal =
+    Refusal { status: NOT_OWNER, advice: "That role needs CREATEDB and has to own the database, or be a superuser." };
+const NEEDS_SIGNAL: Refusal = Refusal {
+    status: "cannot_signal",
+    advice:
+        "Closing another role's connections needs membership in pg_signal_backend, or superuser; owning the database does not confer it. Stopping whatever is connected needs neither.",
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -67,6 +84,15 @@ impl Meta {
     pub fn source(&self) -> &str {
         match self {
             Meta::Fork { source, .. } | Meta::Template { source, .. } => source,
+        }
+    }
+
+    /// The worktree a fork was made for. A template belongs to the repository rather than to any
+    /// one worktree, so it has none.
+    pub fn worktree(&self) -> Option<&Path> {
+        match self {
+            Meta::Fork { worktree, .. } => Some(worktree),
+            Meta::Template { .. } => None,
         }
     }
 
@@ -261,9 +287,11 @@ pub struct Admin {
     /// The role every statement here runs as, and the cluster it runs on, for diagnostics.
     role: String,
     server: String,
-    /// The other roles the directives offer for the work at hand, sorted. Naming them is as far
-    /// as the advice on a refused statement can go: worktreepg cannot tell which of them, if
-    /// any, owns the database, so it cannot say that reordering would help.
+    /// The other roles the directives offer for the work at hand, sorted. The advice on a refused
+    /// statement names all of them rather than the one that would have worked: it is built from
+    /// what the failure carried, without going back to the server. [`Admin::owner_of`] is that
+    /// question, asked ahead of the statement by the caller whose answer changes which role runs
+    /// it rather than only what the error says.
     others: Vec<String>,
 }
 
@@ -366,19 +394,26 @@ impl Admin {
     /// The error for a statement the server rejected. A permission failure names the role,
     /// because statements run as the role in the first directive URL that named the database,
     /// which is not necessarily the role in the variable being applied, and says what `needs`
-    /// that role would have to have. The other roles the directives offer are named after it,
-    /// since one of them may be the owner; which one, worktreepg cannot tell.
-    fn refused(&self, action: &str, needs: &str, e: postgres::Error) -> anyhow::Error {
+    /// that role would have to have. The other roles the directives offer are named after it:
+    /// the advice is built from what the failure carried, without going back to the server, so it
+    /// names all of them rather than the one that would have worked. [`Admin::owner_of`] is that
+    /// question, asked ahead of the statement by the caller whose answer changes which role runs
+    /// it rather than only what the error says.
+    fn refused(&self, action: &str, needs: Refusal, e: postgres::Error) -> anyhow::Error {
         let denied = e.as_db_error().filter(|db| db.code() == &SqlState::INSUFFICIENT_PRIVILEGE).map(|db| db.message().to_string());
         let Some(message) = denied else { return anyhow::Error::new(e).context(action.to_string()) };
-        let mut advice = needs.to_string();
+        let mut advice = needs.advice.to_string();
         if !self.others.is_empty() {
             let others = self.others.iter().map(|r| format!("\"{r}\"")).collect::<Vec<_>>().join(", ");
             advice.push_str(&format!(
                 " Statements on a database run as the role in the first directive URL that names it; the other URLs for it connect as {others}, so if one of those owns it, list its URL first."
             ));
         }
-        environment(format!("{action}{} on {}: {message}. {advice}", as_role(&self.role), self.server))
+        environment_as(
+            needs.status,
+            vec![("role", json!(self.role))],
+            format!("{action}{} on {}: {message}. {advice}", as_role(&self.role), self.server),
+        )
     }
 
     pub fn copy_method(&self) -> CopyMethod {
@@ -424,6 +459,23 @@ impl Admin {
     pub fn exists(&mut self, name: &str) -> Result<bool> {
         let row = self.client.query_opt("SELECT 1 FROM pg_database WHERE datname = $1", &[&name])?;
         Ok(row.is_some())
+    }
+
+    /// The role that owns `name`, or `None` when there is no such database. `pg_database` is
+    /// world-readable, so this answers for any role, including one that owns nothing on the
+    /// cluster.
+    pub fn owner_of(&mut self, name: &str) -> Result<Option<String>> {
+        let row = self.client.query_opt("SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = $1", &[&name])?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    /// Whether this connection's role has the privileges of `name`'s owner, which is the check
+    /// Postgres makes before it lets a role drop or alter a database: a superuser and a member of
+    /// the owning role both pass it, where comparing role names would not. False where there is
+    /// no such database.
+    fn owns(&mut self, name: &str) -> Result<bool> {
+        let row = self.client.query_opt("SELECT pg_has_role(datdba, 'USAGE') FROM pg_database WHERE datname = $1", &[&name])?;
+        Ok(row.is_some_and(|r| r.get(0)))
     }
 
     /// Metadata of a database, or `None` when it does not exist or was not created by worktreepg.
@@ -649,12 +701,31 @@ impl Admin {
         Ok(TemplateStatus::Dropped)
     }
 
-    /// Drops a fork. Callers pass names from [`Admin::forks_for`], so ownership is already known.
+    /// Drops a fork. Callers pass names from [`Admin::forks_for`], so worktreepg made it for this
+    /// repository; whether this connection's role owns it is a separate question, and the only
+    /// answer to it is the server's, which comes as a refusal carrying [`NOT_OWNER`].
     pub fn drop_fork(&mut self, name: &str, dry_run: bool) -> Result<()> {
         if !dry_run {
             self.drop_database(name)?;
         }
         Ok(())
+    }
+
+    /// The refusal a drop of `name`, owned by `owner`, would meet here, for a dry run, which runs
+    /// no statement to be refused by. Ownership is the whole of what can be asked ahead of the
+    /// drop, and `pg_has_role` is the check the drop itself makes, so this is the server's answer
+    /// rather than a guess from the role names: a superuser and a member of `owner` both pass it.
+    /// What is attached to the database is a question for the moment the drop runs, so `None` is
+    /// not a promise that it will go through.
+    pub fn drop_refusal(&mut self, name: &str, owner: &str) -> Result<Option<anyhow::Error>> {
+        if self.owns(name)? {
+            return Ok(None);
+        }
+        Ok(Some(environment_as(
+            NOT_OWNER,
+            vec![("role", json!(self.role))],
+            format!("dropping database {name}{} on {}: \"{owner}\" owns it, so Postgres will refuse it.", as_role(&self.role), self.server),
+        )))
     }
 
     /// Whether the template exists; an existing database of that name that is not our template
@@ -701,6 +772,13 @@ impl Admin {
     }
 
     /// `DROP DATABASE ... WITH (FORCE)`, clearing the template flag first when needed.
+    ///
+    /// `FORCE` closes whatever is still attached, and Postgres refuses a backend this role may not
+    /// signal with the same `INSUFFICIENT_PRIVILEGE` it refuses a drop by a role that does not own
+    /// the database with. The two want different remedies, and only one of them leaves the caller
+    /// another role to try, so which it was is put to the server: a role that got as far as the
+    /// signal had already passed the drop's ownership check. A server that will not answer that
+    /// leaves the refusal reported as the ownership one.
     fn drop_database(&mut self, name: &str) -> Result<()> {
         let is_template: bool =
             self.client.query_opt("SELECT datistemplate FROM pg_database WHERE datname = $1", &[&name])?.is_some_and(|r| r.get(0));
@@ -709,7 +787,11 @@ impl Admin {
             let sql = format!("ALTER DATABASE {} WITH IS_TEMPLATE false ALLOW_CONNECTIONS true", ident(name));
             self.run(&action, &sql)?;
         }
-        self.run(&action, &format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", ident(name)))
+        let Err(e) = self.client.batch_execute(&format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", ident(name))) else {
+            return Ok(());
+        };
+        let signalling = e.code() == Some(&SqlState::INSUFFICIENT_PRIVILEGE) && self.owns(name).unwrap_or(false);
+        Err(self.refused(&action, if signalling { NEEDS_SIGNAL } else { NEEDS_OWNERSHIP }, e))
     }
 }
 
