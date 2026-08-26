@@ -1014,3 +1014,171 @@ fn one_database_failing_still_rewrites_the_rest() {
     db.drop_role("half_ra");
     db.drop_role("half_rb");
 }
+
+/// A fork whose source database no directive names any more. Nothing that scans the cluster can
+/// reach the owning role through the directives, so the drop is refused; the fork is skipped and
+/// the rest of the run finishes, and the message says what brings it back within reach. Where any
+/// URL on the cluster does connect as the owning role, the refusal is retried there and nothing is
+/// skipped at all. A refusal that is not about ownership is not a skip: no directive puts it
+/// right, so it still fails the run.
+#[test]
+fn a_fork_no_directive_reaches_is_skipped_rather_than_stopping_the_run() {
+    let Some(admin_url) = test_url("a_fork_no_directive_reaches_is_skipped_rather_than_stopping_the_run") else { return };
+    let mut db = Db::connect(&admin_url, "orphan");
+    db.owner_of("orphan_ra", "orphan_alpha");
+    db.owner_of("orphan_rb", "orphan_beta");
+    db.owner_of("orphan_rb", "orphan_gamma");
+    let alpha_url = db.url_as("orphan_ra", "orphan_alpha");
+    let beta_url = db.url_as("orphan_rb", "orphan_beta");
+    let gamma_url = db.url_as("orphan_rb", "orphan_gamma");
+
+    let root = tempfile::tempdir().unwrap();
+    let root: PathBuf = root.path().canonicalize().unwrap();
+    let repo = root.join("orphan");
+    fs::create_dir(&repo).unwrap();
+    git(&["init", "-q", "-b", "main"], &repo);
+    fs::write(repo.join(".gitignore"), ".env\n.worktreeinclude\n").unwrap();
+    let directive = |vars: &str| fs::write(repo.join(".worktreeinclude"), format!("# worktreepg: .env {vars}\n.env\n")).unwrap();
+    directive("ALPHA_URL BETA_URL");
+    // every URL stays in the env file throughout; what changes is which of them a directive names
+    let env = format!("ALPHA_URL=\"{alpha_url}\"\nBETA_URL=\"{beta_url}\"\nGAMMA_URL=\"{gamma_url}\"\n");
+    fs::write(repo.join(".env"), &env).unwrap();
+    fs::write(repo.join("README.md"), "orphan\n").unwrap();
+    git(&["add", "."], &repo);
+    git(&["commit", "-q", "-m", "init"], &repo);
+
+    let gone = root.join("orphan-gone");
+    git(&["worktree", "add", "-q", gone.to_str().unwrap(), "-b", "gone"], &repo);
+    fs::write(gone.join(".env"), &env).unwrap();
+    let r = run(&["apply"], &gone, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 2);
+    assert_eq!(db.owner("orphan_beta_gone"), "orphan_rb");
+
+    // the directive naming orphan_beta is removed, so the only credentials left on this cluster
+    // are orphan_ra's, and orphan_ra owns neither orphan_beta nor its fork
+    directive("ALPHA_URL");
+
+    // a dry run runs no statement, so it asks the server the question the drop would ask rather
+    // than promising a plan it cannot carry out: the skip it predicts is the one the real run
+    // reports, down to the exit code
+    let r = run(&["remove", gone.to_str().unwrap(), "--dry-run"], &repo, true);
+    assert_eq!(r.code, 4, "{}", r.stderr);
+    assert_eq!(summary(&r, "dropped"), 1);
+    assert_eq!(summary(&r, "skipped"), 1);
+    let skip = r.json["actions"].as_array().unwrap().iter().find(|a| a["op"] == "skip").unwrap();
+    assert_eq!(skip["database"], "orphan_beta_gone");
+    assert_eq!(skip["status"], "not_owner");
+    assert_eq!(skip["owner"], "orphan_rb");
+    assert_eq!(skip["predicted"], true);
+    assert!(gone.is_dir());
+
+    // the real run drops what it can, skips what it cannot, and exits 4
+    let r = run(&["remove", gone.to_str().unwrap()], &repo, false);
+    assert_eq!(r.code, 4, "{}\n{}", r.stdout, r.stderr);
+    assert!(r.stdout.contains("dropped=1"), "{}", r.stdout);
+    assert!(r.stdout.contains("skipped=1"), "{}", r.stdout);
+    assert!(r.stdout.contains("skip      orphan_beta_gone"), "{}", r.stdout);
+    assert!(r.stdout.contains("must be owner of database orphan_beta_gone"), "{}", r.stdout);
+    assert!(r.stdout.contains("connects as \"orphan_rb\""), "{}", r.stdout);
+    assert!(r.stdout.contains("such as the one for \"orphan_beta\""), "{}", r.stdout);
+    assert!(!gone.exists());
+    assert!(!db.exists("orphan_alpha_gone"));
+    assert!(db.exists("orphan_beta_gone"));
+
+    // and prune says the same thing rather than failing, so the fork is not stuck behind a hard
+    // error on every later run. --quiet takes the line off stdout, and a run that leaves work
+    // undone still has to say which fork it was, so the same line goes to stderr
+    let r = run(&["prune", "--quiet"], &repo, false);
+    assert_eq!(r.code, 4, "{}\n{}", r.stdout, r.stderr);
+    assert_eq!(r.stdout, "", "{}", r.stdout);
+    assert!(r.stderr.contains("skip      orphan_beta_gone"), "{}", r.stderr);
+
+    let r = run(&["prune"], &repo, true);
+    assert_eq!(r.code, 4, "{}", r.stderr);
+    assert_eq!(summary(&r, "dropped"), 0);
+    assert_eq!(summary(&r, "skipped"), 1);
+    let skip = r.json["actions"].as_array().unwrap().iter().find(|a| a["database"] == "orphan_beta_gone").unwrap();
+    assert_eq!(skip["status"], "not_owner");
+    assert_eq!(skip["source"], "orphan_beta");
+    assert_eq!(skip["owner"], "orphan_rb");
+    assert_eq!(skip["role"], "orphan_ra");
+    assert_eq!(skip["predicted"], false);
+
+    // the remedy the message names, taken
+    directive("ALPHA_URL BETA_URL");
+    let r = run(&["prune"], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "dropped"), 1);
+    assert_eq!(summary(&r, "skipped"), 0);
+    assert!(!db.exists("orphan_beta_gone"));
+
+    // orphan_rb owns orphan_gamma as well, so a directive naming that one reaches orphan_beta's
+    // fork too: the refusal the cluster's own URL meets is retried as the role that owns it
+    directive("ALPHA_URL BETA_URL GAMMA_URL");
+    let wide = root.join("orphan-wide");
+    git(&["worktree", "add", "-q", wide.to_str().unwrap(), "-b", "wide"], &repo);
+    fs::write(wide.join(".env"), &env).unwrap();
+    let r = run(&["apply"], &wide, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 3);
+
+    directive("ALPHA_URL GAMMA_URL");
+    let r = run(&["remove", wide.to_str().unwrap()], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "dropped"), 3);
+    assert_eq!(summary(&r, "skipped"), 0);
+    assert!(!db.exists("orphan_beta_wide"));
+
+    // the same retry where the directive naming the source is the one that cannot drop the fork:
+    // BETA_URL is rewritten to connect as orphan_ra, which owns neither orphan_beta nor its fork,
+    // and GAMMA_URL is still orphan_rb's
+    directive("ALPHA_URL BETA_URL GAMMA_URL");
+    let mixed = root.join("orphan-mixed");
+    git(&["worktree", "add", "-q", mixed.to_str().unwrap(), "-b", "mixed"], &repo);
+    fs::write(mixed.join(".env"), &env).unwrap();
+    let r = run(&["apply"], &mixed, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 3);
+    fs::write(repo.join(".env"), env.replace(&beta_url, &db.url_as("orphan_ra", "orphan_beta"))).unwrap();
+    let r = run(&["remove", mixed.to_str().unwrap()], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "dropped"), 3);
+    assert_eq!(summary(&r, "skipped"), 0);
+    assert!(!db.exists("orphan_beta_mixed"));
+
+    // a refusal that is not about ownership: orphan_rb owns this fork, and the WITH (FORCE) drop
+    // is refused over a superuser's backend it may not signal. No directive changes that, so the
+    // run fails on it rather than reporting a skip whose remedy would not work
+    directive("GAMMA_URL");
+    let held = root.join("orphan-held");
+    git(&["worktree", "add", "-q", held.to_str().unwrap(), "-b", "held"], &repo);
+    fs::write(held.join(".env"), &env).unwrap();
+    let r = run(&["apply"], &held, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 1);
+    assert_eq!(db.owner("orphan_gamma_held"), "orphan_rb");
+    {
+        let _holder = db.client("orphan_gamma_held");
+        let r = run(&["remove", held.to_str().unwrap()], &repo, false);
+        assert_eq!(r.code, 4, "{}\n{}", r.stdout, r.stderr);
+        assert!(!r.stdout.contains("skip      "), "{}", r.stdout);
+        assert!(r.stderr.contains("dropping database orphan_gamma_held"), "{}", r.stderr);
+        assert!(r.stderr.contains("terminate"), "{}", r.stderr);
+        assert!(r.stderr.contains("pg_signal_backend"), "{}", r.stderr);
+        assert!(db.exists("orphan_gamma_held"));
+    }
+
+    // and once nothing is attached, prune drops the fork the failed run left behind
+    db.wait_idle("orphan_gamma_held");
+    let r = run(&["prune"], &repo, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "dropped"), 1);
+    assert!(!db.exists("orphan_gamma_held"));
+
+    for name in ["orphan_alpha", "orphan_beta", "orphan_gamma", "orphan"] {
+        db.admin.batch_execute(&format!("DROP DATABASE \"{name}\" WITH (FORCE)")).unwrap();
+    }
+    db.drop_role("orphan_ra");
+    db.drop_role("orphan_rb");
+}

@@ -33,6 +33,20 @@ impl Reporter {
         }
     }
 
+    /// An action a command has to report even where it was asked to say as little as possible:
+    /// work it could not do, which is the whole of what a run that exits non-zero has to show for
+    /// itself. `--quiet` takes the terse line off stdout, so it goes to stderr instead, the way
+    /// the error this would have been printed as did. `--json` carries it in the document, and
+    /// stderr stays clear of anything that is not JSON.
+    pub fn action_or_warn(&mut self, action: Value, line: impl AsRef<str>) {
+        self.actions.push(action);
+        if self.quiet && !self.json {
+            eprintln!("warning: {}", line.as_ref());
+        } else {
+            self.print(line.as_ref());
+        }
+    }
+
     pub fn info(&self, line: impl AsRef<str>) {
         self.print(line.as_ref());
     }

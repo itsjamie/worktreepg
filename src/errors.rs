@@ -62,6 +62,13 @@ pub fn annotated(err: anyhow::Error, note: &str) -> anyhow::Error {
     CliError { code, message: format!("{err:#}; {note}"), detail }.into()
 }
 
+/// An environment error the caller reports under `status` rather than its generic one, carrying
+/// `fields` into the action so a caller has the same facts the message gives a reader. The status
+/// is also how a caller tells the one kind it can carry on past from the ones it cannot.
+pub fn environment_as(status: &'static str, fields: Vec<(&'static str, Value)>, message: impl Into<String>) -> anyhow::Error {
+    CliError { code: EXIT_ENVIRONMENT, message: message.into(), detail: Some(Detail { status, fields }) }.into()
+}
+
 pub fn is_conflict(err: &anyhow::Error) -> bool {
     err.downcast_ref::<CliError>().is_some_and(|e| e.code == EXIT_CONFLICT)
 }
