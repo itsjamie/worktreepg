@@ -175,6 +175,15 @@ fn summary(r: &Run, key: &str) -> u64 {
     r.json["summary"][key].as_u64().unwrap_or_else(|| panic!("summary.{key} missing in {}\n{}", r.stdout, r.stderr))
 }
 
+/// The message on the first `op` action, which is where `--json` carries the reason a database
+/// was not forked. A run that reports the failure rather than returning it prints its line on
+/// stderr, but under `--json` stdout is the only stream, so this is all such a caller has.
+fn message(r: &Run, op: &str) -> String {
+    let actions = r.json["actions"].as_array().unwrap_or_else(|| panic!("no actions in {}\n{}", r.stdout, r.stderr));
+    let action = actions.iter().find(|a| a["op"] == op).unwrap_or_else(|| panic!("no {op} action in {}", r.stdout));
+    action["message"].as_str().unwrap_or_else(|| panic!("no message on {op} in {}", r.stdout)).to_string()
+}
+
 /// The test cluster, or `None` when there is none and the test should skip.
 fn test_url(test: &str) -> Option<String> {
     match std::env::var("WORKTREE_PG_TEST_URL") {
@@ -426,14 +435,19 @@ fn end_to_end() {
         let _holder = db.client("app");
         let r = run(&["apply", "--recreate"], &auth, true);
         assert_eq!(r.code, 4, "{}", r.stderr);
-        assert!(r.stderr.contains("1 open connection"), "{}", r.stderr);
-        assert!(r.stderr.contains("--terminate"), "{}", r.stderr);
+        assert_eq!(summary(&r, "errors"), 1);
+        let failure = message(&r, "error");
+        assert!(failure.contains("1 open connection"), "{failure}");
+        assert!(failure.contains("--terminate"), "{failure}");
         let r = run(&["apply", "--recreate", "--dry-run"], &auth, true);
         assert_eq!(r.code, 4, "{}", r.stderr);
     }
+    // and the fork it could not replace is still there, with its data: --recreate refuses before
+    // it drops rather than after, so the run costs the branch nothing
+    assert_eq!(db.things("app_feature_auth"), ["one"]);
     let r = run(&["apply"], &auth, true);
     assert_eq!(r.code, 0, "{}", r.stderr);
-    assert_eq!(summary(&r, "created"), 1);
+    assert_eq!(summary(&r, "skipped_existing"), 1);
 
     // a variable pointing somewhere unexpected is a conflict unless --force
     fs::write(auth.join(".env"), format!("DATABASE_URL=\"{}\"\n", db.url("somewhere_else"))).unwrap();
@@ -737,10 +751,11 @@ fn mixed_credentials() {
     fs::write(again.join("runtime.env"), &runtime_env).unwrap();
     let r = run(&["apply", "--include", "runtime.worktreeinclude"], &again, true);
     assert_eq!(r.code, 4, "{}", r.stderr);
-    assert!(r.stderr.contains("creating database mixed_again as \"mixed_runtime\""), "{}", r.stderr);
-    assert!(r.stderr.contains("permission denied"), "{}", r.stderr);
-    assert!(r.stderr.contains("needs CREATEDB"), "{}", r.stderr);
-    assert!(!r.stderr.contains("list its URL first"), "{}", r.stderr);
+    let failure = message(&r, "error");
+    assert!(failure.contains("creating database mixed_again as \"mixed_runtime\""), "{failure}");
+    assert!(failure.contains("permission denied"), "{failure}");
+    assert!(failure.contains("needs CREATEDB"), "{failure}");
+    assert!(!failure.contains("list its URL first"), "{failure}");
     assert!(!db.exists("mixed_again"));
 
     // list the unprivileged URL first and everything runs as it. The message says what the role
@@ -752,11 +767,12 @@ fn mixed_credentials() {
     fs::write(reversed.join("runtime.env"), &runtime_env).unwrap();
     let r = run(&["apply", "--include", "reversed.worktreeinclude"], &reversed, true);
     assert_eq!(r.code, 4, "{}", r.stderr);
-    assert!(r.stderr.contains("creating database mixed_reversed as \"mixed_runtime\""), "{}", r.stderr);
-    assert!(r.stderr.contains("needs CREATEDB"), "{}", r.stderr);
+    let failure = message(&r, "error");
+    assert!(failure.contains("creating database mixed_reversed as \"mixed_runtime\""), "{failure}");
+    assert!(failure.contains("needs CREATEDB"), "{failure}");
     let admin_role: String = db.admin.query_one("SELECT current_user", &[]).unwrap().get(0);
-    assert!(r.stderr.contains(&format!("the other URLs for it connect as \"{admin_role}\"")), "{}", r.stderr);
-    assert!(r.stderr.contains("list its URL first"), "{}", r.stderr);
+    assert!(failure.contains(&format!("the other URLs for it connect as \"{admin_role}\"")), "{failure}");
+    assert!(failure.contains("list its URL first"), "{failure}");
     assert!(!db.exists("mixed_reversed"));
 
     let r = run(&["template", "drop"], &repo, true);
@@ -892,4 +908,109 @@ fn two_owners_on_one_cluster() {
     }
     db.drop_role("owners_ra");
     db.drop_role("owners_rb");
+}
+
+/// A failure on one database no longer costs the run the databases that did fork: their variables
+/// are still rewritten, the one that failed keeps naming its live database, and a second run picks
+/// up where this one stopped. The failure a connection could have predicted never reaches the
+/// loop, and under `--recreate`, where carrying on would put another fork's data at risk, the loop
+/// stops at the first failure instead.
+#[test]
+fn one_database_failing_still_rewrites_the_rest() {
+    let Some(admin_url) = test_url("one_database_failing_still_rewrites_the_rest") else { return };
+    let mut db = Db::connect(&admin_url, "half");
+    db.owner_of("half_ra", "half_alpha");
+    db.owner_of("half_rb", "half_beta");
+    let alpha_url = db.url_as("half_ra", "half_alpha");
+    let beta_url = db.url_as("half_rb", "half_beta");
+
+    let root = tempfile::tempdir().unwrap();
+    let root: PathBuf = root.path().canonicalize().unwrap();
+    let repo = root.join("half");
+    fs::create_dir(&repo).unwrap();
+    git(&["init", "-q", "-b", "main"], &repo);
+    fs::write(repo.join(".gitignore"), ".env\n.worktreeinclude\n").unwrap();
+    fs::write(repo.join(".worktreeinclude"), "# worktreepg: .env ALPHA_URL BETA_URL\n.env\n").unwrap();
+    let env = format!("ALPHA_URL=\"{alpha_url}\"\nBETA_URL=\"{beta_url}\"\n");
+    fs::write(repo.join(".env"), &env).unwrap();
+    fs::write(repo.join("README.md"), "half\n").unwrap();
+    git(&["add", "."], &repo);
+    git(&["commit", "-q", "-m", "init"], &repo);
+
+    // the permission flavour: beta's owner cannot fork it, which no connection can tell in advance
+    let work = root.join("half-work");
+    git(&["worktree", "add", "-q", work.to_str().unwrap(), "-b", "wt"], &repo);
+    fs::write(work.join(".env"), &env).unwrap();
+    db.admin.batch_execute("ALTER ROLE \"half_rb\" NOCREATEDB").unwrap();
+
+    let r = run(&["apply"], &work, false);
+    assert_eq!(r.code, 4, "an environment error stays one rather than becoming the generic 1: {}", r.stdout);
+    assert!(r.stderr.contains("error     half_beta_wt:"), "{}", r.stderr);
+    assert!(r.stderr.contains("needs CREATEDB"), "{}", r.stderr);
+    // the server's own words, not only worktreepg's description of what it was doing
+    assert!(r.stderr.contains("permission denied"), "{}", r.stderr);
+    assert!(r.stdout.contains("created=1"), "{}", r.stdout);
+    assert!(r.stdout.contains("errors=1"), "{}", r.stdout);
+    assert!(r.stdout.contains("rewritten=1"), "{}", r.stdout);
+    assert!(db.exists("half_alpha_wt"));
+    assert!(!db.exists("half_beta_wt"));
+    assert_eq!(
+        fs::read_to_string(work.join(".env")).unwrap(),
+        format!("ALPHA_URL=\"{}\"\nBETA_URL=\"{beta_url}\"\n", db.url_as("half_ra", "half_alpha_wt")),
+        "the fork that was made is reachable, and the one that was not still names its live database"
+    );
+
+    // --quiet prints no summary, so stderr is the only stream left for the failure to reach a
+    // script on: counting it rather than returning it must not take it off both
+    let r = run(&["apply", "--quiet"], &work, false);
+    assert_eq!(r.code, 4, "{}", r.stderr);
+    assert_eq!(r.stdout, "", "{}", r.stdout);
+    assert!(r.stderr.contains("error     half_beta_wt:"), "{}", r.stderr);
+
+    // and once the reason is gone a second run finishes the job, adopting the fork already there
+    db.admin.batch_execute("ALTER ROLE \"half_rb\" CREATEDB").unwrap();
+    let r = run(&["apply"], &work, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 1);
+    assert_eq!(summary(&r, "skipped_existing"), 1);
+    assert_eq!(summary(&r, "rewritten"), 1);
+    assert_eq!(
+        fs::read_to_string(work.join(".env")).unwrap(),
+        format!("ALPHA_URL=\"{}\"\nBETA_URL=\"{}\"\n", db.url_as("half_ra", "half_alpha_wt"), db.url_as("half_rb", "half_beta_wt"))
+    );
+
+    // --recreate is the flag under which carrying on would cost data, because the fork is dropped
+    // to make room for its replacement. half_alpha is in use and has no snapshot to fall back on,
+    // so its fork is not dropped at all, and the run stops rather than trying the same on half_beta.
+    {
+        let _holder = db.client("half_alpha");
+        let r = run(&["apply", "--recreate"], &work, true);
+        assert_eq!(r.code, 4, "{}", r.stderr);
+        assert_eq!(summary(&r, "errors"), 1);
+        assert_eq!(summary(&r, "created"), 0, "half_beta was not attempted after half_alpha failed");
+        assert!(message(&r, "error").contains("half_alpha"), "{}", r.stdout);
+        assert!(db.exists("half_alpha_wt"), "the fork that could not be replaced is still there");
+        assert!(db.exists("half_beta_wt"), "and so is the one the run never reached");
+    }
+    db.wait_idle("half_alpha");
+
+    // the connectivity flavour: a server that will not answer is settled before the first fork.
+    // The directives take their URLs from the source worktree, so that is where the dead port goes.
+    let down = root.join("half-down");
+    git(&["worktree", "add", "-q", down.to_str().unwrap(), "-b", "down"], &repo);
+    let down_env = format!("ALPHA_URL=\"{alpha_url}\"\nBETA_URL=\"postgres://half_rb:pw@127.0.0.1:1/half_beta\"\n");
+    fs::write(repo.join(".env"), &down_env).unwrap();
+    fs::write(down.join(".env"), &down_env).unwrap();
+
+    let r = run(&["apply"], &down, true);
+    assert_eq!(r.code, 4, "{}", r.stderr);
+    assert!(r.stderr.contains("nothing was created and no env file was written"), "{}", r.stderr);
+    assert!(!db.exists("half_alpha_down"), "the reachable database is not forked either");
+    assert_eq!(fs::read_to_string(down.join(".env")).unwrap(), down_env);
+
+    for name in ["half_alpha_wt", "half_beta_wt", "half_alpha", "half_beta", "half"] {
+        db.admin.batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)")).unwrap();
+    }
+    db.drop_role("half_ra");
+    db.drop_role("half_rb");
 }

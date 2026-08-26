@@ -21,7 +21,7 @@ pub struct CliError {
 /// What one kind of error puts in the action the caller reports it in: the status to use instead
 /// of the caller's generic one, and the fields that let a `--json` caller act on the error
 /// without reading its message.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Detail {
     pub status: &'static str,
     pub fields: Vec<(&'static str, Value)>,
@@ -51,6 +51,15 @@ pub fn conflict_as(status: &'static str, fields: Vec<(&'static str, Value)>, mes
 
 pub fn environment(message: impl Into<String>) -> anyhow::Error {
     CliError { code: EXIT_ENVIRONMENT, message: message.into(), detail: None }.into()
+}
+
+/// The same failure with `note` appended, for a caller saying what its run did not do. The exit
+/// code and the detail the error already carries are kept, because naming the work left undone
+/// is no reason to reclassify what went wrong.
+pub fn annotated(err: anyhow::Error, note: &str) -> anyhow::Error {
+    let cli = err.downcast_ref::<CliError>();
+    let (code, detail) = (cli.map_or(EXIT_INTERNAL, |e| e.code), cli.and_then(|e| e.detail.clone()));
+    CliError { code, message: format!("{err:#}; {note}"), detail }.into()
 }
 
 pub fn is_conflict(err: &anyhow::Error) -> bool {
