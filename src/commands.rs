@@ -3,7 +3,7 @@
 
 use crate::db::{self, CopyMethod, ForkOptions, ForkSpec, ForkStatus, Meta, Origin, Pool, TemplateOptions, TemplateStatus};
 use crate::envfile::EnvFile;
-use crate::errors::{detail_of, environment, is_conflict, usage, EXIT_CONFLICT, EXIT_INTERNAL};
+use crate::errors::{annotated, detail_of, environment, exit_code, is_conflict, usage, EXIT_CONFLICT, EXIT_INTERNAL};
 use crate::git;
 use crate::pgurl::PgUrl;
 use crate::project::{clusters, databases, EnvVar, ProblemKind, Project};
@@ -77,6 +77,31 @@ fn note_storage(pool: &mut Pool, clusters: &[PgUrl], url: &PgUrl, noted: &mut Ha
     }
 }
 
+/// Connects to every database the directives name, while the command has still changed nothing.
+/// A server that is down or a password that is wrong is one failure for every database on that
+/// cluster, so finding it here costs the run nothing; the price is that a directive naming a
+/// cluster that is gone for good blocks the command, the reachable clusters included, until the
+/// directive or the env file is fixed. `left` names the state the command stopped in, since a
+/// bare connection failure reads the same on either side of the work.
+fn connect_all(pool: &mut Pool, live: &[PgUrl], left: &str) -> Result<()> {
+    for url in live {
+        pool.for_database(url, &url.database).map_err(|e| annotated(e, left))?;
+    }
+    Ok(())
+}
+
+/// A reported failure's action, under whatever status and fields the error asked to be reported
+/// with in place of the caller's generic ones.
+fn detailed(mut action: Value, e: &anyhow::Error) -> Value {
+    if let Some(detail) = detail_of(e) {
+        action["status"] = json!(detail.status);
+        for (field, value) in &detail.fields {
+            action[*field] = value.clone();
+        }
+    }
+    action
+}
+
 pub struct ApplyOptions {
     pub worktree_name: Option<String>,
     pub recreate: bool,
@@ -115,14 +140,19 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
         ("worktree", json!({ "branch": branch, "name": worktree_name })),
     ]);
 
-    let finish = |counts: &mut Counts, reporter: &Reporter| -> i32 {
+    // `exit` carries the code a swallowed failure would have exited with, so counting one instead
+    // of returning it does not also reclassify it: an unreachable server stays an environment
+    // error rather than becoming the internal error `errors` maps to.
+    let finish = |counts: &mut Counts, reporter: &Reporter, exit: Option<i32>| -> i32 {
         if opts.dry_run {
             counts.rename("created", "create_planned");
             counts.rename("template_refreshed", "template_refresh_planned");
             counts.rename("rewritten", "rewrite_planned");
         }
         reporter.finish(doc.clone(), counts);
-        if counts.get("errors") > 0 {
+        if let Some(code) = exit {
+            code
+        } else if counts.get("errors") > 0 {
             EXIT_INTERNAL
         } else if counts.get("conflicts") > 0 {
             EXIT_CONFLICT
@@ -133,15 +163,15 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
 
     if project.target == project.source {
         reporter.info(format!("{} is the source worktree; nothing to fork", project.target.display()));
-        return Ok(finish(&mut counts, reporter));
+        return Ok(finish(&mut counts, reporter, None));
     }
 
     let (vars, problems) = project.env_vars()?;
     for p in &problems {
         if p.kind == ProblemKind::InvalidUrl {
             counts.inc("errors");
-            reporter.action(
-                json!({ "op": "error", "path": p.file, "var": p.name, "status": "invalid_url" }),
+            reporter.failure(
+                json!({ "op": "error", "path": p.file, "var": p.name, "status": "invalid_url", "message": p.detail }),
                 format!("error     {}", p.detail),
             );
         } else {
@@ -159,14 +189,21 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
 
     let Plan { targets, names, blocked } = resolve(project, &by_file, &worktree_name, opts.force, &mut counts, reporter)?;
     if blocked {
-        return Ok(finish(&mut counts, reporter));
+        return Ok(finish(&mut counts, reporter, None));
     }
 
     let mut pool = Pool::new(vars.iter().map(|v| &v.url));
     let clusters = clusters(&vars);
+    // Taken before the first CREATE DATABASE, so a failure a connection can predict stops the run
+    // having made a fork whose variable the rewrite pass would never reach. What no connection
+    // could predict, such as a role without CREATEDB, still surfaces one database at a time below.
+    connect_all(&mut pool, &databases(&vars), "nothing was created and no env file was written")?;
     let mut tried: HashSet<String> = HashSet::new();
     let mut forks: HashSet<String> = HashSet::new();
     let mut noted: HashSet<String> = HashSet::new();
+    // First error wins: an exit code names the kind of thing that went wrong, not how badly, so
+    // there is nothing for a later failure of another kind to be worse than.
+    let mut exit: Option<i32> = None;
     for v in &vars {
         let key = v.url.database_key();
         // One attempt per database, however many variables name it. `forks` cannot stand in for
@@ -185,7 +222,10 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
         };
         let fork_opts = ForkOptions { recreate: opts.recreate, terminate: opts.terminate, dry_run: opts.dry_run };
         note_storage(&mut pool, &clusters, &v.url, &mut noted, reporter);
-        match pool.for_database(&v.url, &v.url.database)?.ensure_fork(&spec, fork_opts) {
+        // The pre-flight above connected to this database, so this is a cache hit; folding it in
+        // keeps the borrow inside the match rather than needing a `?` the loop would return on. A
+        // server that goes away mid-run surfaces from the queries inside `ensure_fork`.
+        match pool.for_database(&v.url, &v.url.database).and_then(|admin| admin.ensure_fork(&spec, fork_opts)) {
             Ok(ForkStatus::Forked { from, copy, origin }) => {
                 counts.inc("created");
                 let st = status(opts.dry_run);
@@ -247,22 +287,48 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
             // is the orphan this ordering exists to prevent.
             Err(e) if is_conflict(&e) => {
                 counts.inc("conflicts");
-                let mut action = json!({ "op": "conflict", "database": name, "status": "unmanaged" });
-                if let Some(detail) = detail_of(&e) {
-                    action["status"] = json!(detail.status);
-                    for (field, value) in &detail.fields {
-                        action[*field] = value.clone();
-                    }
-                }
-                reporter.action(action, format!("conflict  {name}: {e}"));
+                reporter.action(
+                    detailed(json!({ "op": "conflict", "database": name, "status": "unmanaged" }), &e),
+                    format!("conflict  {name}: {e}"),
+                );
                 continue;
             }
-            Err(e) => return Err(e),
+            // Nor can any other per-database failure, and for the same reason: returning here
+            // would leave every fork made so far pointing at nothing, because the rewrite pass
+            // runs only once the loop is done. A database that failed having created nothing
+            // stays out of `forks`, so its variables keep naming the live database.
+            Err(e) => {
+                counts.inc("errors");
+                exit.get_or_insert_with(|| exit_code(&e));
+                // The whole chain, the way returning it would have printed it: the outermost
+                // context describes the statement, and the server's reason for refusing it is
+                // underneath. The messages are built out of database names, roles, and servers,
+                // so no URL passes through them, and "failed" classifies nothing on its own, so
+                // the message travels in the action rather than only in the line.
+                let message = format!("{e:#}");
+                reporter.failure(
+                    detailed(json!({ "op": "error", "database": name, "status": "failed", "message": &message }), &e),
+                    format!("error     {name}: {message}"),
+                );
+                // --recreate drops the fork before it clones the replacement, so a failure past
+                // that point has already cost this database its fork and its data, and the error
+                // does not say whether it did. The run stops rather than risking the same on
+                // every database left; the rewrite pass below still runs, so the forks it did
+                // make are reachable, and a second apply picks the rest up.
+                if opts.recreate {
+                    break;
+                }
+                continue;
+            }
         }
         forks.insert(key);
     }
 
     for Target { file, mut env, vars } in targets {
+        // A file's rewrites are held until its save has been attempted, so nothing is reported as
+        // written that the file does not hold: a caller acting on a rewrite, by reading the file
+        // back or restarting the service that reads it, would otherwise act on the live URL.
+        let mut pending: Vec<(Value, String)> = Vec::new();
         for p in &vars {
             if !forks.contains(&p.source) {
                 continue;
@@ -277,17 +343,39 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
                 continue;
             }
             env.set(&v.name, &v.url.with_database(fork));
-            counts.inc("rewritten");
-            reporter.action(
+            pending.push((
                 json!({ "op": "rewrite", "path": file, "var": v.name, "database": fork, "status": status(opts.dry_run) }),
                 format!("rewrite   {file} {} -> {fork}{}", v.name, planned(opts.dry_run)),
-            );
+            ));
         }
-        if !opts.dry_run {
-            env.save()?;
+        let refused = if opts.dry_run { None } else { env.save().err() };
+        match refused {
+            None => {
+                counts.add("rewritten", pending.len());
+                for (action, line) in pending {
+                    reporter.action(action, line);
+                }
+            }
+            // One unwritable file is not a reason to leave the other files unwritten: each one is
+            // a separate rewrite, and the forks behind all of them exist either way. This file's
+            // rewrites are reported as not written, and counted as neither.
+            Some(e) => {
+                let e = anyhow::Error::from(e);
+                for (mut action, line) in pending {
+                    action["status"] = json!("not_written");
+                    reporter.action(action, line);
+                }
+                counts.inc("errors");
+                exit.get_or_insert_with(|| exit_code(&e));
+                let message = format!("{e:#}");
+                reporter.failure(
+                    json!({ "op": "error", "path": file, "status": "failed", "message": &message }),
+                    format!("error     {file}: {message}; its rewrites were not written"),
+                );
+            }
         }
     }
-    Ok(finish(&mut counts, reporter))
+    Ok(finish(&mut counts, reporter, exit))
 }
 
 /// What one variable's rewrite will be, decided before anything is created and carried to the
@@ -363,7 +451,11 @@ fn resolve<'a>(
             }
             Err(e) => {
                 counts.inc("errors");
-                reporter.action(json!({ "op": "error", "database": v.url.database, "status": "unnameable" }), format!("error     {e}"));
+                let message = format!("{e:#}");
+                reporter.failure(
+                    json!({ "op": "error", "database": v.url.database, "status": "unnameable", "message": &message }),
+                    format!("error     {message}"),
+                );
                 plan.blocked = true;
             }
         }
@@ -422,16 +514,12 @@ pub fn remove(project: &Project, opts: &RemoveOptions, reporter: &mut Reporter) 
     // Every database the directives name, not only the ones holding a fork of this worktree:
     // telling those apart needs the connection anyway. One connection per (cluster, role) is
     // enough to cover the cluster scans below as well, because the first URL naming a cluster is
-    // also the first URL naming its own database. The error names the state the command stopped
-    // in, since a bare connection failure reads the same on either side of the removal.
+    // also the first URL naming its own database.
     let (vars, problems) = project.env_vars()?;
     warn_all(&problems, reporter);
     let mut pool = Pool::new(vars.iter().map(|v| &v.url));
     let live = databases(&vars);
-    for url in &live {
-        pool.for_database(url, &url.database)
-            .map_err(|e| environment(format!("{e}; {} was left in place and no database was dropped", target.display())))?;
-    }
+    connect_all(&mut pool, &live, &format!("{} was left in place and no database was dropped", target.display()))?;
 
     if registered && !opts.keep_worktree {
         if !opts.dry_run {

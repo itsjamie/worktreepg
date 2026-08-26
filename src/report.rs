@@ -22,6 +22,17 @@ impl Reporter {
         self.print(line.as_ref());
     }
 
+    /// An action whose line goes to stderr, and past `--quiet`: a failure a command counts and
+    /// carries on from still has to reach a reader the way returning it would have, and under
+    /// `--quiet` there is not even a summary line to carry it. Under `--json` the action carries
+    /// the message and stdout stays the only stream, as it does for `warn`.
+    pub fn failure(&mut self, action: Value, line: impl AsRef<str>) {
+        self.actions.push(action);
+        if !self.json {
+            eprintln!("{}", line.as_ref());
+        }
+    }
+
     pub fn info(&self, line: impl AsRef<str>) {
         self.print(line.as_ref());
     }

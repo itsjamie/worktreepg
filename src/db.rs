@@ -455,8 +455,13 @@ impl Admin {
     /// as current as the last fork. Re-running is a no-op. A database of that name that
     /// worktreepg did not create for this repository, or that records a different worktree, is a
     /// conflict, with or without `recreate`: the recorded worktree may be a live one whose name
-    /// normalizes to the same fork name, and recreating then drops its data.
+    /// normalizes to the same fork name, and recreating then drops its data. With `recreate` the
+    /// existing fork is dropped only once the source looks copyable, so a run that cannot make
+    /// the replacement keeps the fork it had.
     pub fn ensure_fork(&mut self, spec: &ForkSpec, opts: ForkOptions) -> Result<ForkStatus> {
+        // Read before the fork is dropped below, because whether there is a snapshot to clone
+        // from is what decides whether dropping it can be made good.
+        let template = self.template_of(&spec.source)?;
         if self.exists(&spec.name)? {
             match self.meta(&spec.name)? {
                 Some(Meta::Template { .. }) => {
@@ -490,11 +495,23 @@ impl Admin {
                 return Ok(ForkStatus::Exists);
             }
             if !opts.dry_run {
+                // The fork is only dropped once the source looks copyable, the way a template
+                // refresh keeps the snapshot it had: with nothing to fall back on, a --recreate
+                // that runs into a connected app would otherwise cost the fork and its data and
+                // put nothing in its place. The count is an upper bound rather than what Postgres
+                // itself tests, so a bound is treated as connections: refusing a copy Postgres
+                // would have made keeps the fork, where taking the bound for nothing would drop
+                // it before the copy fails.
+                if template.is_none() && !opts.terminate {
+                    let attached = self.connections(&spec.source)?;
+                    if attached.upper() > 0 {
+                        return Err(in_use(&spec.source, attached, Basis::Predicted));
+                    }
+                }
                 self.drop_database(&spec.name)?;
             }
         }
 
-        let template = self.template_of(&spec.source)?;
         let copy = self.copy;
         let fallback = |template: Option<ExistingTemplate>, attached: Attached, basis: Basis| match template {
             Some(t) => Ok((t.name, Origin::Template { attached, created_at: t.created_at })),
