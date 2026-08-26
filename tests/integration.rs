@@ -1,7 +1,8 @@
 //! End-to-end: the real binary against a real git repository with worktrees and a real
 //! Postgres cluster. Needs `WORKTREE_PG_TEST_URL` pointing at a superuser on a maintenance
-//! database of a cluster running with autovacuum off, which is what the exact connection counts
-//! asserted on here need (scripts/test-db.sh starts one); skips otherwise.
+//! database of a cluster running with autovacuum off, which is what the drops made as a plain
+//! owner and the exact connection counts asserted on here need (scripts/test-db.sh starts one,
+//! and says why); skips otherwise.
 
 use postgres::{Client, NoTls};
 use serde_json::Value;
@@ -530,6 +531,10 @@ fn end_to_end() {
         assert_eq!(r.code, 0, "{}", r.stderr);
         let create = r.json["actions"].as_array().unwrap().iter().find(|a| a["op"] == "create_database").unwrap();
         assert_eq!(create["from"], "app_template");
+        // The count is reported because no row was masked: this run is a superuser, and
+        // pg_stat_activity names the type of every session for it, so the one connection here is
+        // the holder and not a worker. two_owners_on_one_cluster is the other half of this,
+        // where the session holding the database belongs to a role the run cannot read.
         assert_eq!(create["live_connections"], 1, "{}", r.stderr);
         assert_eq!(create["origin"], "template");
         assert_eq!(create["snapshot_created_at"], template_created_at);
@@ -820,21 +825,44 @@ fn two_owners_on_one_cluster() {
     assert_eq!(summary(&r, "created"), 2);
     assert_eq!(summary(&r, "template_refreshed"), 2);
 
-    // a live database in use falls back to its template, and the count in that message is taken
-    // on the owner's connection rather than a superuser's: pg_stat_activity gives a plain role
-    // NULL for backend_type on every session but its own, so a query that leans on that column
-    // sees no connections at all and reports a database nothing is attached to
     let busy = root.join("owners-busy");
     git(&["worktree", "add", "-q", busy.to_str().unwrap(), "-b", "busy"], &repo);
     fs::write(busy.join(".env"), &env).unwrap();
+
+    // a connection held by the role that does the work is counted as what it is: pg_stat_activity
+    // gives a role the type of every session whose role it holds the privileges of, which on the
+    // ordinary cluster where the app and the admin URL share a role is all of them
+    {
+        let _app = Client::connect(&db.url_as("owners_ra", "owners_alpha"), NoTls).unwrap();
+        let r = run(&["apply", "--dry-run"], &busy, false);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert!(r.stderr.contains("owners_alpha has 1 open connection"), "{}", r.stderr);
+    }
+    db.wait_idle("owners_alpha");
+
+    // a live database in use falls back to its template, and the fallback is reported without a
+    // number when the session holding it belongs to a role this one cannot read: backend_type
+    // comes back NULL, so what can be counted is an upper bound over client backends and
+    // autovacuum workers together rather than a count of the app
     {
         // held as the superuser, so owners_ra is not the role that owns this backend
         let _holder = db.client("owners_alpha");
+        let r = run(&["apply", "--dry-run"], &busy, false);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        // a dry run predicts the fallback from that bound, and says so rather than reporting it
+        assert!(r.stderr.contains("owners_alpha looks to be in use by something this role cannot identify"), "{}", r.stderr);
+        assert!(!r.stderr.contains("open connection"), "{}", r.stderr);
         let r = run(&["apply"], &busy, true);
         assert_eq!(r.code, 0, "{}", r.stderr);
         let create = r.json["actions"].as_array().unwrap().iter().find(|a| a["database"] == "owners_alpha_busy").unwrap();
         assert_eq!(create["from"], "owners_alpha_template");
-        assert_eq!(create["live_connections"], 1, "{}", r.stdout);
+        assert_eq!(create["origin"], "template");
+        assert!(create.get("live_connections").is_none(), "{}", r.stdout);
+        // and again over the fork it just made, for the message: this one is not a prediction,
+        // Postgres refused the live database
+        let r = run(&["apply", "--recreate"], &busy, false);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        assert!(r.stderr.contains("owners_alpha is in use by something this role cannot identify"), "{}", r.stderr);
     }
     let r = run(&["remove", busy.to_str().unwrap()], &repo, true);
     assert_eq!(r.code, 0, "{}", r.stderr);
