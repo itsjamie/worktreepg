@@ -496,11 +496,9 @@ struct PlannedVar<'a> {
     same: bool,
 }
 
-/// A target env file, held open from the pre-flight to the write so the decision for a file and
-/// the write for it cannot disagree. The content is the pre-flight's, and `save` writes all of
-/// it back, so an edit made from outside while the forks are being cloned (roughly a second per
-/// database) is overwritten rather than noticed. Before, that window was only as long as the
-/// rewrite pass.
+/// A target env file kept from the pre-flight to the write so the decision for a file and the
+/// write for it cannot disagree. `save` refuses if an outside edit lands while the forks are
+/// being cloned, preserving that edit rather than overwriting it with the pre-flight content.
 struct Target<'a> {
     file: &'a str,
     env: EnvFile,

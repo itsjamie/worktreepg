@@ -10,17 +10,17 @@ use std::path::{Path, PathBuf};
 pub struct EnvFile {
     path: PathBuf,
     content: String,
-    dirty: bool,
+    original: Option<String>,
 }
 
 impl EnvFile {
     /// Fails with `NotFound` when the file is absent; an env file is never created here.
     pub fn open(path: &Path) -> io::Result<Self> {
-        Ok(Self { path: path.to_path_buf(), content: fs::read_to_string(path)?, dirty: false })
+        Ok(Self { path: path.to_path_buf(), content: fs::read_to_string(path)?, original: None })
     }
 
     pub fn from_content(path: &Path, content: String) -> Self {
-        Self { path: path.to_path_buf(), content, dirty: false }
+        Self { path: path.to_path_buf(), content, original: None }
     }
 
     /// Value of the last assignment of `name`, matching dotenv's last-wins rule.
@@ -30,6 +30,9 @@ impl EnvFile {
 
     /// Rewrites every assignment of `name`, or appends one when there is none.
     pub fn set(&mut self, name: &str, value: &str) {
+        if self.original.is_none() {
+            self.original = Some(self.content.clone());
+        }
         let found = find_assignments(&self.content, name);
         if found.is_empty() {
             let sep = if self.content.is_empty() || self.content.ends_with('\n') { "" } else { "\n" };
@@ -41,18 +44,22 @@ impl EnvFile {
             }
             self.content = lines.join("\n");
         }
-        self.dirty = true;
     }
 
     pub fn content(&self) -> &str {
         &self.content
     }
 
-    /// Writes the file only if `set` was called.
+    /// Writes the file only if `set` was called and nobody changed it since [`EnvFile::open`].
     pub fn save(&mut self) -> io::Result<()> {
-        if self.dirty {
+        if let Some(original) = &self.original {
+            // This is an optimistic check, not a lock: a writer can still land between the read
+            // and write. If env-file writes become routinely concurrent, add cross-process locking.
+            if fs::read_to_string(&self.path)? != *original {
+                return Err(io::Error::other(format!("{} changed since it was read", self.path.display())));
+            }
             fs::write(&self.path, &self.content)?;
-            self.dirty = false;
+            self.original = None;
         }
         Ok(())
     }
@@ -166,5 +173,18 @@ mod tests {
         let mut f = env("A=1\r\nB=2\r\n");
         f.set("A", "9");
         assert_eq!(f.content(), "A=9\r\nB=2\r\n");
+    }
+
+    #[test]
+    fn save_preserves_an_edit_made_since_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        fs::write(&path, "A=1\n").unwrap();
+        let mut f = EnvFile::open(&path).unwrap();
+        f.set("A", "2");
+        fs::write(&path, "A=3\n").unwrap();
+
+        assert!(f.save().unwrap_err().to_string().contains("changed since it was read"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "A=3\n");
     }
 }
