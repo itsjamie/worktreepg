@@ -12,7 +12,8 @@
 //! The first token is the env file, relative to the worktree root. Every token after it is
 //! a variable in that file whose Postgres connection string should be pointed at the fork.
 
-use anyhow::{bail, Result};
+use crate::errors::environment;
+use anyhow::Result;
 use regex::Regex;
 use std::path::{Component, Path};
 use std::sync::LazyLock;
@@ -53,13 +54,13 @@ pub fn parse_directives(content: &str) -> Result<Vec<Directive>> {
             }
             [file, vars @ ..] => {
                 if Path::new(file).components().any(|part| !matches!(part, Component::CurDir | Component::Normal(_))) {
-                    bail!(".worktreeinclude:{line}: env file must be relative to the worktree: \"{file}\"");
+                    return Err(environment(format!(".worktreeinclude:{line}: env file must be relative to the worktree: \"{file}\"")));
                 }
                 let vars: Vec<String> =
                     if vars.is_empty() { vec![DEFAULT_VAR.into()] } else { vars.iter().map(|v| (*v).to_string()).collect() };
                 for v in &vars {
                     if !VAR_RE.is_match(v) {
-                        bail!(".worktreeinclude:{line}: \"{v}\" is not a valid environment variable name");
+                        return Err(environment(format!(".worktreeinclude:{line}: \"{v}\" is not a valid environment variable name")));
                     }
                 }
                 directives.push(Directive { file: file.trim_start_matches("./").to_string(), vars, line });
@@ -72,6 +73,7 @@ pub fn parse_directives(content: &str) -> Result<Vec<Directive>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errors::EXIT_ENVIRONMENT;
 
     fn d(file: &str, vars: &[&str], line: usize) -> Directive {
         Directive { file: file.into(), vars: vars.iter().map(|v| (*v).into()).collect(), line }
@@ -100,12 +102,15 @@ mod tests {
 
     #[test]
     fn rejects_invalid_variable_names() {
-        assert!(parse_directives("# worktreepg: .env DATABASE-URL").is_err());
+        let err = parse_directives("# worktreepg: .env DATABASE-URL").unwrap_err();
+        assert_eq!(crate::errors::exit_code(&err), EXIT_ENVIRONMENT);
     }
 
     #[test]
     fn rejects_env_files_outside_the_worktree() {
-        assert!(parse_directives("# worktreepg: ../.env DATABASE_URL").is_err());
-        assert!(parse_directives("# worktreepg: /tmp/.env DATABASE_URL").is_err());
+        for file in ["../.env", "/tmp/.env"] {
+            let err = parse_directives(&format!("# worktreepg: {file} DATABASE_URL")).unwrap_err();
+            assert_eq!(crate::errors::exit_code(&err), EXIT_ENVIRONMENT);
+        }
     }
 }
