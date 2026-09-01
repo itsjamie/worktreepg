@@ -776,7 +776,7 @@ pub fn template(project: &Project, cmd: &TemplateCommand, reporter: &mut Reporte
         let admin = pool.for_database(url, &url.database)?;
         let copy = admin.copy_method();
         let result = match cmd.action {
-            TemplateAction::Drop => admin.drop_template(&url.database, opts),
+            TemplateAction::Drop => admin.drop_template(&url.database, &project.repo, opts),
             _ => admin.snapshot_template(&url.database, &project.repo, opts),
         };
         let st = status(cmd.dry_run);

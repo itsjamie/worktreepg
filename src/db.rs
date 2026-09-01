@@ -102,6 +102,10 @@ impl Meta {
         }
     }
 
+    fn is_template_for(&self, expected_repo: &Path, expected_source: &str) -> bool {
+        matches!(self, Meta::Template { repo, source, .. } if repo == expected_repo && source == expected_source)
+    }
+
     pub fn encode(&self) -> String {
         format!("{META_PREFIX}{}", serde_json::to_string(self).expect("meta serializes"))
     }
@@ -563,7 +567,7 @@ impl Admin {
     pub fn ensure_fork(&mut self, spec: &ForkSpec, opts: ForkOptions) -> Result<ForkStatus> {
         // Read before the fork is dropped below, because whether there is a snapshot to clone
         // from is what decides whether dropping it can be made good.
-        let template = self.template_of(&spec.source)?;
+        let template = self.template_of(&spec.source, &spec.repo)?;
         if self.exists(&spec.name)? {
             match self.meta(&spec.name)? {
                 Some(Meta::Template { .. }) => {
@@ -681,7 +685,7 @@ impl Admin {
     /// `ALLOW_CONNECTIONS false`, so it can never be in use when a fork is being made.
     pub fn snapshot_template(&mut self, source: &str, repo: &Path, opts: TemplateOptions) -> Result<TemplateStatus> {
         let name = template_name(source);
-        let exists = self.check_template_ownership(&name, opts.force)?;
+        let exists = self.check_template_ownership(&name, source, repo, opts.force)?;
         if exists && !opts.replace {
             return Ok(TemplateStatus::Exists);
         }
@@ -718,10 +722,10 @@ impl Admin {
     }
 
     /// The template snapshotted from `source`, if worktreepg created one.
-    fn template_of(&mut self, source: &str) -> Result<Option<ExistingTemplate>> {
+    fn template_of(&mut self, source: &str, repo: &Path) -> Result<Option<ExistingTemplate>> {
         let name = template_name(source);
         Ok(match self.meta(&name)? {
-            Some(Meta::Template { created_at, .. }) => Some(ExistingTemplate { name, created_at }),
+            Some(meta) if meta.is_template_for(repo, source) => Some(ExistingTemplate { name, created_at: meta.created_at().to_string() }),
             _ => None,
         })
     }
@@ -749,9 +753,9 @@ impl Admin {
         Ok(Attached::counted(row.get(0), row.get(1)))
     }
 
-    pub fn drop_template(&mut self, source: &str, opts: TemplateOptions) -> Result<TemplateStatus> {
+    pub fn drop_template(&mut self, source: &str, repo: &Path, opts: TemplateOptions) -> Result<TemplateStatus> {
         let name = template_name(source);
-        if !self.check_template_ownership(&name, opts.force)? {
+        if !self.check_template_ownership(&name, source, repo, opts.force)? {
             return Ok(TemplateStatus::Missing);
         }
         if !opts.dry_run {
@@ -789,14 +793,14 @@ impl Admin {
 
     /// Whether the template exists; an existing database of that name that is not our template
     /// is a conflict unless `force`.
-    fn check_template_ownership(&mut self, name: &str, force: bool) -> Result<bool> {
+    fn check_template_ownership(&mut self, name: &str, source: &str, repo: &Path, force: bool) -> Result<bool> {
         if !self.exists(name)? {
             return Ok(false);
         }
         match self.meta(name)? {
-            Some(Meta::Template { .. }) => Ok(true),
+            Some(meta) if meta.is_template_for(repo, source) => Ok(true),
             _ if force => Ok(true),
-            _ => Err(conflict(format!("{name} exists but was not created by worktreepg (use --force to take it over)"))),
+            _ => Err(conflict(format!("{name} exists but is not this repository's template for {source} (use --force to take it over)"))),
         }
     }
 
@@ -1067,6 +1071,14 @@ mod tests {
         assert_eq!(Meta::decode("production database"), None);
         assert_eq!(Meta::decode("worktreepg not json"), None);
         assert_eq!(Meta::decode("worktreepg {\"kind\":\"fork\",\"v\":2,\"repo\":\"/\",\"source\":\"a\",\"template\":\"a\",\"worktree\":\"/\",\"branch\":null,\"createdAt\":\"\"}"), None);
+    }
+
+    #[test]
+    fn template_identity_includes_its_repository_and_source() {
+        let meta = Meta::Template { v: 1, repo: "/one/.git".into(), source: "app".into(), created_at: String::new() };
+        assert!(meta.is_template_for(Path::new("/one/.git"), "app"));
+        assert!(!meta.is_template_for(Path::new("/two/.git"), "app"));
+        assert!(!meta.is_template_for(Path::new("/one/.git"), "other"));
     }
 
     #[test]
