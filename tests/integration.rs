@@ -1023,6 +1023,17 @@ fn two_owners_on_one_cluster() {
     assert_eq!(summary(&r, "created"), 2);
     assert_eq!(db.owner("owners_alpha_template"), "owners_ra");
 
+    // A refused drop must restore the flags it had to clear before trying the drop.
+    db.admin.batch_execute("ALTER DATABASE \"owners_alpha_template\" WITH ALLOW_CONNECTIONS true").unwrap();
+    {
+        let _holder = db.client("owners_alpha_template");
+        db.admin.batch_execute("ALTER DATABASE \"owners_alpha_template\" WITH ALLOW_CONNECTIONS false").unwrap();
+        let r = run(&["template", "drop"], &repo, true);
+        assert_eq!(r.code, 4, "{}", r.stderr);
+        assert_eq!(db.flags("owners_alpha_template"), (true, false));
+    }
+    db.wait_idle("owners_alpha_template");
+
     // the destructive path: each fork is dropped and re-made by the role that owns its source
     let r = run(&["apply", "--recreate"], &work, true);
     assert_eq!(r.code, 0, "{}", r.stderr);

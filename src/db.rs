@@ -10,7 +10,7 @@
 //! (see [`Pool`]). The development database itself is never held open here, so it stays usable
 //! as a `TEMPLATE`.
 
-use crate::errors::{conflict, conflict_as, environment, environment_as};
+use crate::errors::{annotated, conflict, conflict_as, environment, environment_as};
 use crate::pgurl::PgUrl;
 use crate::storage::{self, Sharing};
 use anyhow::Result;
@@ -906,7 +906,8 @@ impl Admin {
         self.run(&format!("commenting on database {name}"), &sql)
     }
 
-    /// `DROP DATABASE ... WITH (FORCE)`, clearing the template flag first when needed.
+    /// `DROP DATABASE ... WITH (FORCE)`, clearing the template flag first when needed and
+    /// restoring its original flags if the drop is refused.
     ///
     /// `FORCE` closes whatever is still attached, and Postgres refuses a backend this role may not
     /// signal with the same `INSUFFICIENT_PRIVILEGE` it refuses a drop by a role that does not own
@@ -915,10 +916,12 @@ impl Admin {
     /// signal had already passed the drop's ownership check. A server that will not answer that
     /// leaves the refusal reported as the ownership one.
     fn drop_database(&mut self, name: &str) -> Result<()> {
-        let is_template: bool =
-            self.client.query_opt("SELECT datistemplate FROM pg_database WHERE datname = $1", &[&name])?.is_some_and(|r| r.get(0));
+        let flags: Option<(bool, bool)> = self
+            .client
+            .query_opt("SELECT datistemplate, datallowconn FROM pg_database WHERE datname = $1", &[&name])?
+            .map(|r| (r.get(0), r.get(1)));
         let action = format!("dropping database {name}");
-        if is_template {
+        if flags.is_some_and(|(is_template, _)| is_template) {
             let sql = format!("ALTER DATABASE {} WITH IS_TEMPLATE false ALLOW_CONNECTIONS true", ident(name));
             self.run(&action, &sql)?;
         }
@@ -926,7 +929,14 @@ impl Admin {
             return Ok(());
         };
         let signalling = e.code() == Some(&SqlState::INSUFFICIENT_PRIVILEGE) && self.owns(name).unwrap_or(false);
-        Err(self.refused(&action, if signalling { NEEDS_SIGNAL } else { NEEDS_OWNERSHIP }, e))
+        let refusal = self.refused(&action, if signalling { NEEDS_SIGNAL } else { NEEDS_OWNERSHIP }, e);
+        if let Some((true, allow_connections)) = flags {
+            let sql = format!("ALTER DATABASE {} WITH IS_TEMPLATE true ALLOW_CONNECTIONS {allow_connections}", ident(name));
+            if let Err(restore) = self.run(&format!("restoring database {name} after its drop failed"), &sql) {
+                return Err(annotated(refusal, &format!("restoring its template flags also failed: {restore:#}")));
+            }
+        }
+        Err(refusal)
     }
 }
 
