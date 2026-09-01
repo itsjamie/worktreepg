@@ -625,7 +625,12 @@ pub fn remove(project: &Project, opts: &RemoveOptions, reporter: &mut Reporter) 
     // enough to cover the cluster scans below as well, because the first URL naming a cluster is
     // also the first URL naming its own database.
     let (vars, problems) = project.env_vars()?;
-    warn_all(&problems, reporter);
+    if warn_all(&problems, reporter) {
+        return Err(environment(format!(
+            "{} was left in place and no database was dropped because a source URL is invalid",
+            target.display()
+        )));
+    }
     let mut pool = Pool::new(vars.iter().map(|v| &v.url));
     let live = databases(&vars);
     connect_all(&mut pool, &live, &format!("{} was left in place and no database was dropped", target.display()))?;
@@ -669,7 +674,7 @@ pub fn prune(project: &Project, dry_run: bool, reporter: &mut Reporter) -> Resul
     let living: HashSet<PathBuf> = git::living_worktrees(&project.cwd)?.into_iter().collect();
     let mut counts = Counts::new(&["forks", "dropped", "kept", "skipped"]);
     let (vars, problems) = project.env_vars()?;
-    warn_all(&problems, reporter);
+    let invalid_url = warn_all(&problems, reporter);
     let mut pool = Pool::new(vars.iter().map(|v| &v.url));
     let live = databases(&vars);
     for cluster in &clusters(&vars) {
@@ -690,7 +695,7 @@ pub fn prune(project: &Project, dry_run: bool, reporter: &mut Reporter) -> Resul
         }
     }
     reporter.finish(document(vec![("dry_run", json!(dry_run))]), &counts);
-    Ok(if counts.get("skipped") > 0 { EXIT_ENVIRONMENT } else { 0 })
+    Ok(if invalid_url || counts.get("skipped") > 0 { EXIT_ENVIRONMENT } else { 0 })
 }
 
 /// Shows the template and forks on each cluster, and whether each fork's worktree still exists.
@@ -699,7 +704,7 @@ pub fn list(project: &Project, all: bool, reporter: &mut Reporter) -> Result<i32
     let living: HashSet<PathBuf> = git::living_worktrees(&project.cwd)?.into_iter().collect();
     let mut rows = Vec::new();
     let (vars, problems) = project.env_vars()?;
-    warn_all(&problems, reporter);
+    let invalid_url = warn_all(&problems, reporter);
     let mut pool = Pool::new(vars.iter().map(|v| &v.url));
     for cluster in &clusters(&vars) {
         let server = cluster.server();
@@ -734,7 +739,7 @@ pub fn list(project: &Project, all: bool, reporter: &mut Reporter) -> Result<i32
     let mut counts = Counts::default();
     counts.add("databases", rows.len());
     reporter.finish(document(vec![("databases", Value::Array(rows))]), &counts);
-    Ok(0)
+    Ok(if invalid_url { EXIT_ENVIRONMENT } else { 0 })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -758,7 +763,7 @@ pub fn template(project: &Project, cmd: &TemplateCommand, reporter: &mut Reporte
     project.require_directives()?;
     let mut counts = Counts::new(&["created", "dropped", "skipped", "conflicts"]);
     let (vars, problems) = project.env_vars()?;
-    warn_all(&problems, reporter);
+    let invalid_url = warn_all(&problems, reporter);
     let mut pool = Pool::new(vars.iter().map(|v| &v.url));
     let clusters = clusters(&vars);
     let mut noted: HashSet<String> = HashSet::new();
@@ -831,14 +836,22 @@ pub fn template(project: &Project, cmd: &TemplateCommand, reporter: &mut Reporte
         TemplateAction::Drop => "drop",
     };
     reporter.finish(document(vec![("dry_run", json!(cmd.dry_run)), ("action", json!(action))]), &counts);
-    Ok(if counts.get("conflicts") > 0 { EXIT_CONFLICT } else { 0 })
+    Ok(if invalid_url {
+        EXIT_ENVIRONMENT
+    } else if counts.get("conflicts") > 0 {
+        EXIT_CONFLICT
+    } else {
+        0
+    })
 }
 
 /// Problems reading the source env files are warnings for the database-management commands.
-fn warn_all(problems: &[crate::project::Problem], reporter: &Reporter) {
+/// Returns whether any URL was invalid, which must also make the command fail.
+fn warn_all(problems: &[crate::project::Problem], reporter: &Reporter) -> bool {
     for p in problems {
         reporter.warn(&p.detail);
     }
+    problems.iter().any(|p| p.kind == ProblemKind::InvalidUrl)
 }
 
 #[cfg(test)]

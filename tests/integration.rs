@@ -234,6 +234,15 @@ fn an_invalid_source_url_is_an_environment_error() {
     assert_eq!(r.code, 4, "{}", r.stderr);
     assert_eq!(summary(&r, "errors"), 1);
     assert!(r.json["actions"].as_array().unwrap().iter().any(|action| action["status"] == "invalid_url"));
+
+    for args in [["prune"].as_slice(), ["list"].as_slice(), ["template", "create"].as_slice()] {
+        let r = run(args, &repo, true);
+        assert_eq!(r.code, 4, "{args:?}: {}", r.stderr);
+    }
+
+    let r = run(&["remove"], &work, true);
+    assert_eq!(r.code, 4, "{}", r.stderr);
+    assert!(work.exists(), "remove must preserve the worktree when its source URL is invalid");
 }
 
 #[test]
