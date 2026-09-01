@@ -14,6 +14,7 @@
 
 use anyhow::{bail, Result};
 use regex::Regex;
+use std::path::{Component, Path};
 use std::sync::LazyLock;
 
 pub const DEFAULT_ENV_FILE: &str = ".env";
@@ -51,6 +52,9 @@ pub fn parse_directives(content: &str) -> Result<Vec<Directive>> {
                 directives.push(Directive { file: DEFAULT_ENV_FILE.into(), vars: vec![(*single).into()], line });
             }
             [file, vars @ ..] => {
+                if Path::new(file).components().any(|part| !matches!(part, Component::CurDir | Component::Normal(_))) {
+                    bail!(".worktreeinclude:{line}: env file must be relative to the worktree: \"{file}\"");
+                }
                 let vars: Vec<String> =
                     if vars.is_empty() { vec![DEFAULT_VAR.into()] } else { vars.iter().map(|v| (*v).to_string()).collect() };
                 for v in &vars {
@@ -97,5 +101,11 @@ mod tests {
     #[test]
     fn rejects_invalid_variable_names() {
         assert!(parse_directives("# worktreepg: .env DATABASE-URL").is_err());
+    }
+
+    #[test]
+    fn rejects_env_files_outside_the_worktree() {
+        assert!(parse_directives("# worktreepg: ../.env DATABASE_URL").is_err());
+        assert!(parse_directives("# worktreepg: /tmp/.env DATABASE_URL").is_err());
     }
 }
