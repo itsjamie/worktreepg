@@ -611,7 +611,7 @@ pub struct RemoveOptions {
 /// `--dry-run` that predicts a skip reports and exits the same way.
 pub fn remove(project: &Project, opts: &RemoveOptions, reporter: &mut Reporter) -> Result<i32> {
     project.require_directives()?;
-    let target = git::canonical(&project.cwd.join(opts.path.as_deref().unwrap_or(".")));
+    let target = opts.path.as_ref().map_or_else(|| project.target.clone(), |path| git::canonical(&project.cwd.join(path)));
     if target == project.source {
         return Err(usage(format!("{} is the source worktree; refusing to remove it", target.display())));
     }

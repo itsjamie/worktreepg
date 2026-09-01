@@ -772,8 +772,10 @@ fn end_to_end() {
     assert!(db.exists("app_feature_auth"), "fork survives a failed pre-flight");
     fs::write(repo.join(".env"), &source_env).unwrap();
 
-    // remove drops the fork and the worktree
-    let r = run(&["remove", auth.to_str().unwrap()], &repo, true);
+    // remove from a subdirectory still defaults to the current worktree root
+    let nested = auth.join("nested");
+    fs::create_dir(&nested).unwrap();
+    let r = run(&["remove"], &nested, true);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert_eq!(summary(&r, "worktree_removed"), 1);
     assert_eq!(summary(&r, "dropped"), 1);
