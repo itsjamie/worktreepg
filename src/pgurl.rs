@@ -33,8 +33,8 @@ impl PgUrl {
             return Err(anyhow!("not a postgres:// URL: {}", redact(&raw)));
         }
         let config = postgres::Config::from_str(&raw).map_err(|e| anyhow!("{}: {e}", redact(&raw)))?;
-        if config.get_hosts().len() > 1 || config.get_hostaddrs().len() > 1 {
-            return Err(anyhow!("multiple Postgres hosts are not supported: {}", redact(&raw)));
+        if config.get_hosts().len() > 1 || config.get_hostaddrs().len() > 1 || config.get_ports().len() > 1 {
+            return Err(anyhow!("multiple Postgres endpoints are not supported: {}", redact(&raw)));
         }
         let user = config.get_user().map(str::to_string);
         let database = config
@@ -165,6 +165,7 @@ mod tests {
         assert!(PgUrl::parse("host=localhost dbname=app").is_err());
         assert!(PgUrl::parse("mysql://x/y").is_err());
         assert!(PgUrl::parse("postgres://u@one,two/db").is_err());
+        assert!(PgUrl::parse("postgres://u@localhost/db?port=5432,5433").is_err());
         assert!(PgUrl::parse("postgres://u@localhost/db#fragment").is_err());
     }
 
