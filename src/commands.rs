@@ -6,12 +6,12 @@ use crate::envfile::EnvFile;
 use crate::errors::{annotated, detail_of, environment, exit_code, is_conflict, usage, EXIT_CONFLICT, EXIT_ENVIRONMENT, EXIT_INTERNAL};
 use crate::git;
 use crate::pgurl::PgUrl;
-use crate::project::{clusters, databases, EnvVar, ProblemKind, Project};
+use crate::project::{clusters, contained_path, databases, EnvVar, ProblemKind, Project};
 use crate::report::{Counts, Reporter};
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn document(pairs: Vec<(&str, Value)>) -> Map<String, Value> {
     pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
@@ -531,7 +531,8 @@ fn resolve<'a>(
     let mut plan = Plan { targets: Vec::new(), names: HashMap::new(), blocked: false };
     let mut opened = Vec::new();
     for (&file, file_vars) in by_file {
-        let path = project.target.join(file);
+        let path = contained_path(&project.target, Path::new(file))
+            .ok_or_else(|| environment(format!("{file} resolves outside the target worktree")))?;
         if !path.is_file() {
             return Err(environment(format!(
                 "{file} does not exist in {} yet. Run \"git worktreeinclude apply\" there first; worktreepg only edits env files it finds.",
