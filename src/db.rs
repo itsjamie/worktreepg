@@ -581,7 +581,17 @@ impl Admin {
                 // moved or been removed is indistinguishable from a second live worktree whose
                 // name normalizes the same way. The message names the remedy for each, and what
                 // prune costs: it drops the fork rather than re-pointing it at the new path.
-                Some(Meta::Fork { ref repo, ref worktree, .. }) if repo == &spec.repo => {
+                Some(Meta::Fork { ref repo, ref source, ref worktree, .. }) if repo == &spec.repo => {
+                    if source != &spec.source {
+                        return Err(conflict_as(
+                            "other_source",
+                            vec![("source", json!(source))],
+                            format!(
+                                "\"{}\" is a fork of database \"{source}\", not \"{}\"; rename one source database or pass --worktree-name",
+                                spec.name, spec.source
+                            ),
+                        ));
+                    }
                     if worktree != &spec.worktree {
                         return Err(conflict_as(
                             "other_worktree",

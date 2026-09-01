@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use worktreepg::db::fork_name;
 use worktreepg::pgurl::{redact, with_database};
 
 struct Run {
@@ -218,6 +219,44 @@ fn fixture(root: &Path, vars: &[&str], live_url: &str) -> (PathBuf, String) {
     git(&["add", "."], &repo);
     git(&["commit", "-q", "-m", "init"], &repo);
     (repo, env)
+}
+
+#[test]
+fn colliding_long_sources_are_not_treated_as_the_same_fork() {
+    let Some(admin_url) = test_url("colliding_long_sources_are_not_treated_as_the_same_fork") else { return };
+    let prefix = "c".repeat(62);
+    let (alpha, beta) = (format!("{prefix}a"), format!("{prefix}b"));
+    let mut db = Db::connect(&admin_url, &alpha);
+    let fork = fork_name(&alpha, "work").unwrap();
+    assert_eq!(fork, fork_name(&beta, "work").unwrap());
+    for name in [&fork, &beta] {
+        db.admin.batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)")).unwrap();
+    }
+    db.admin.batch_execute(&format!("CREATE DATABASE \"{beta}\"")).unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let root: PathBuf = root.path().canonicalize().unwrap();
+    let (repo, _) = fixture(&root, &["ALPHA_URL", "BETA_URL"], &db.url(&alpha));
+    let env = format!("ALPHA_URL=\"{}\"\nBETA_URL=\"{}\"\n", db.url(&alpha), db.url(&beta));
+    fs::write(repo.join(".env"), &env).unwrap();
+    let work = root.join("work");
+    git(&["worktree", "add", "-q", work.to_str().unwrap(), "-b", "work"], &repo);
+    fs::write(work.join(".env"), &env).unwrap();
+
+    let r = run(&["apply"], &work, true);
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 1);
+    assert_eq!(summary(&r, "conflicts"), 1);
+    assert_eq!(summary(&r, "rewritten"), 1);
+    assert_eq!(db.meta(&fork)["source"], alpha);
+    let written = fs::read_to_string(work.join(".env")).unwrap();
+    assert!(written.contains(&format!("ALPHA_URL=\"{}\"", db.url(&fork))));
+    assert!(written.contains(&format!("BETA_URL=\"{}\"", db.url(&beta))));
+
+    git(&["worktree", "remove", "--force", work.to_str().unwrap()], &repo);
+    for name in [&fork, &alpha, &beta] {
+        db.admin.batch_execute(&format!("DROP DATABASE \"{name}\" WITH (FORCE)")).unwrap();
+    }
 }
 
 /// An env variable that already points at a third database stops the run before any database is
