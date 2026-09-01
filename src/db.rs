@@ -696,7 +696,7 @@ impl Admin {
     pub fn snapshot_template(&mut self, source: &str, repo: &Path, opts: TemplateOptions) -> Result<TemplateStatus> {
         let name = template_name(source);
         let exists = self.check_template_ownership(&name, source, repo, opts.force)?;
-        if exists && !opts.replace {
+        if exists && !opts.replace && !opts.force {
             return Ok(TemplateStatus::Exists);
         }
         if opts.dry_run {

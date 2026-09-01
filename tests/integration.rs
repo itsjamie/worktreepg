@@ -642,9 +642,16 @@ fn end_to_end() {
     git(&["worktree", "remove", "--force", unmanaged.to_str().unwrap()], &repo);
     db.admin.batch_execute("DROP DATABASE \"app_unmanaged\"").unwrap();
 
-    // template create snapshots the live database
+    // template create refuses an unmanaged database of the snapshot's name unless --force
+    db.admin.batch_execute("CREATE DATABASE \"app_template\"").unwrap();
     let r = run(&["template", "create"], &repo, true);
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    assert_eq!(summary(&r, "conflicts"), 1);
+
+    // --force takes it over by replacing it with a snapshot of the live database
+    let r = run(&["template", "create", "--force"], &repo, true);
     assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "dropped"), 1);
     assert_eq!(summary(&r, "created"), 1);
     assert_eq!(db.flags("app_template"), (true, false));
     let snapshot_at = db.meta("app_template")["createdAt"].as_str().unwrap().to_string();
