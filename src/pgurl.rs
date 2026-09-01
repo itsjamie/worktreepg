@@ -8,7 +8,7 @@ use regex::Regex;
 use std::str::FromStr;
 use std::sync::LazyLock;
 
-static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(postgres(?:ql)?://[^/?#]*)(/[^?#]*)?([?#].*)?$").unwrap());
+static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(postgres(?:ql)?://[^/?#]*)(/[^?#]*)?(\?.*)?$").unwrap());
 static PASSWORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^([a-z]+://[^:/?#@]*):[^@/?#]*@").unwrap());
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,22 +33,24 @@ impl PgUrl {
             return Err(anyhow!("not a postgres:// URL: {}", redact(&raw)));
         }
         let config = postgres::Config::from_str(&raw).map_err(|e| anyhow!("{}: {e}", redact(&raw)))?;
+        if config.get_hosts().len() > 1 || config.get_hostaddrs().len() > 1 {
+            return Err(anyhow!("multiple Postgres hosts are not supported: {}", redact(&raw)));
+        }
         let user = config.get_user().map(str::to_string);
         let database = config
             .get_dbname()
             .map(str::to_string)
             .or_else(|| user.clone())
             .ok_or_else(|| anyhow!("cannot determine the database name from {}", redact(&raw)))?;
-        let host = config
-            .get_hosts()
-            .first()
-            .map(|h| match h {
+        let host = config.get_hostaddrs().first().map(ToString::to_string).or_else(|| {
+            config.get_hosts().first().map(|h| match h {
                 Host::Tcp(name) => name.clone(),
                 #[cfg(unix)]
                 Host::Unix(path) => path.display().to_string(),
             })
-            .unwrap_or_default();
-        let port = config.get_ports().first().map(|p| p.to_string()).unwrap_or_default();
+        });
+        let host = host.unwrap_or_default();
+        let port = config.get_ports().first().copied().unwrap_or(5432);
         let cluster_key = format!("{host}:{port}");
         Ok(Self { raw, database, cluster_key, user: user.unwrap_or_default(), host })
     }
@@ -81,7 +83,11 @@ impl PgUrl {
 
     /// The cluster as a person names it, without credentials, for output.
     pub fn server(&self) -> String {
-        self.cluster_key.trim_end_matches(':').to_string()
+        if self.host.is_empty() {
+            "local socket".to_string()
+        } else {
+            self.cluster_key.clone()
+        }
     }
 }
 
@@ -126,7 +132,12 @@ mod tests {
         assert!(!u.is_local());
         assert!(PgUrl::parse("postgres://u@localhost/db").unwrap().is_local());
         assert!(PgUrl::parse("postgres://u@/db?host=/var/run/postgresql").unwrap().is_local());
-        assert_eq!(PgUrl::parse("postgres://u@/db?host=/var/run/postgresql").unwrap().server(), "/var/run/postgresql");
+        assert_eq!(PgUrl::parse("postgres://u@/db?host=/var/run/postgresql").unwrap().server(), "/var/run/postgresql:5432");
+        assert_eq!(
+            PgUrl::parse("postgres://u@localhost/db").unwrap().cluster_key,
+            PgUrl::parse("postgres://u@localhost:5432/db").unwrap().cluster_key
+        );
+        assert_eq!(PgUrl::parse("postgres://u@db/db?hostaddr=127.0.0.1").unwrap().cluster_key, "127.0.0.1:5432");
     }
 
     #[test]
@@ -153,11 +164,13 @@ mod tests {
     fn rejects_non_urls() {
         assert!(PgUrl::parse("host=localhost dbname=app").is_err());
         assert!(PgUrl::parse("mysql://x/y").is_err());
+        assert!(PgUrl::parse("postgres://u@one,two/db").is_err());
+        assert!(PgUrl::parse("postgres://u@localhost/db#fragment").is_err());
     }
 
     #[test]
     fn with_database_swaps_only_the_path() {
-        assert_eq!(with_database("postgres://u:p@h:1/app?sslmode=require#x", "app_fork"), "postgres://u:p@h:1/app_fork?sslmode=require#x");
+        assert_eq!(with_database("postgres://u:p@h:1/app?sslmode=require", "app_fork"), "postgres://u:p@h:1/app_fork?sslmode=require");
         assert_eq!(
             with_database("postgres://u@/app?host=/var/run/postgresql", "app_fork"),
             "postgres://u@/app_fork?host=/var/run/postgresql"
