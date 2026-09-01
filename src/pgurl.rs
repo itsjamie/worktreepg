@@ -89,7 +89,22 @@ pub fn with_database(url: &str, database: &str) -> String {
     let Some(caps) = URL_RE.captures(url.trim()) else { return url.to_string() };
     let authority = caps.get(1).map_or("", |m| m.as_str());
     let tail = caps.get(3).map_or("", |m| m.as_str());
-    format!("{authority}/{database}{tail}")
+    format!("{authority}/{}{tail}", encode_path_segment(database))
+}
+
+fn encode_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0xf) as usize]));
+        }
+    }
+    encoded
 }
 
 /// Hides the password so a connection string can appear in diagnostics.
@@ -148,6 +163,8 @@ mod tests {
             "postgres://u@/app_fork?host=/var/run/postgresql"
         );
         assert_eq!(with_database("postgresql://localhost", "x"), "postgresql://localhost/x");
+        assert_eq!(with_database("postgresql://localhost/app", "my db/fork"), "postgresql://localhost/my%20db%2Ffork");
+        assert_eq!(PgUrl::parse("postgresql://localhost/my%20db").unwrap().database, "my db");
     }
 
     #[test]
