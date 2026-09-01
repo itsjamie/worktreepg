@@ -143,12 +143,28 @@ pub fn fork_name(source: &str, worktree_name: &str) -> Result<String> {
     if suffix.is_empty() {
         anyhow::bail!("worktree name \"{worktree_name}\" leaves nothing usable in a database name");
     }
-    Ok(truncate_identifier(format!("{source}_{suffix}")))
+    Ok(derived_identifier(source, &suffix))
 }
 
 /// `<source>_template`: the snapshot forks are cloned from.
 pub fn template_name(source: &str) -> String {
-    truncate_identifier(format!("{source}_template"))
+    derived_identifier(source, "template")
+}
+
+fn derived_identifier(source: &str, suffix: &str) -> String {
+    if source.len() + 1 < MAX_IDENTIFIER {
+        return truncate_identifier(format!("{source}_{suffix}"));
+    }
+
+    let (mut source, mut suffix) = (source.to_string(), suffix.to_string());
+    while source.len() + 1 + suffix.len() > MAX_IDENTIFIER {
+        if source.chars().nth(1).is_some() {
+            source.pop();
+        } else {
+            suffix.pop();
+        }
+    }
+    format!("{source}_{suffix}")
 }
 
 fn truncate_identifier(mut name: String) -> String {
@@ -1018,6 +1034,15 @@ mod tests {
     fn names_fit_in_63_bytes() {
         assert_eq!(fork_name("app", &"x".repeat(100)).unwrap().len(), 63);
         assert_eq!(template_name("app"), "app_template");
+
+        let source = "x".repeat(63);
+        let fork = fork_name(&source, "feature/auth").unwrap();
+        let template = template_name(&source);
+        assert!(fork.len() <= 63 && fork != source && fork.ends_with("_feature_auth"));
+        assert!(template.len() <= 63 && template != source && template.ends_with("_template"));
+
+        let unicode_source = format!("{}x", "é".repeat(31));
+        assert!(template_name(&unicode_source).len() <= 63);
     }
 
     #[test]
