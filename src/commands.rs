@@ -264,9 +264,11 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
     }
 
     let (vars, problems) = project.env_vars()?;
+    let mut exit = None;
     for p in &problems {
         if p.kind == ProblemKind::InvalidUrl {
             counts.inc("errors");
+            exit = Some(EXIT_ENVIRONMENT);
             reporter.failure(
                 json!({ "op": "error", "path": p.file, "var": p.name, "status": "invalid_url", "message": p.detail }),
                 format!("error     {}", p.detail),
@@ -286,7 +288,7 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
 
     let Plan { targets, names, blocked } = resolve(project, &by_file, &worktree_name, opts.force, &mut counts, reporter)?;
     if blocked {
-        return Ok(finish(&mut counts, reporter, None));
+        return Ok(finish(&mut counts, reporter, exit));
     }
 
     let mut pool = Pool::new(vars.iter().map(|v| &v.url));
@@ -300,7 +302,6 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
     let mut noted: HashSet<String> = HashSet::new();
     // First error wins: an exit code names the kind of thing that went wrong, not how badly, so
     // there is nothing for a later failure of another kind to be worse than.
-    let mut exit: Option<i32> = None;
     for v in &vars {
         let key = v.url.database_key();
         // One attempt per database, however many variables name it. `forks` cannot stand in for

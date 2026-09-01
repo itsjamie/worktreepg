@@ -222,6 +222,21 @@ fn fixture(root: &Path, vars: &[&str], live_url: &str) -> (PathBuf, String) {
 }
 
 #[test]
+fn an_invalid_source_url_is_an_environment_error() {
+    let root = tempfile::tempdir().unwrap();
+    let root: PathBuf = root.path().canonicalize().unwrap();
+    let (repo, source_env) = fixture(&root, &["DATABASE_URL"], "not-a-postgres-url");
+    let work = root.join("work");
+    git(&["worktree", "add", "-q", work.to_str().unwrap(), "-b", "work"], &repo);
+    fs::write(work.join(".env"), source_env).unwrap();
+
+    let r = run(&["apply"], &work, true);
+    assert_eq!(r.code, 4, "{}", r.stderr);
+    assert_eq!(summary(&r, "errors"), 1);
+    assert!(r.json["actions"].as_array().unwrap().iter().any(|action| action["status"] == "invalid_url"));
+}
+
+#[test]
 fn colliding_long_sources_are_not_treated_as_the_same_fork() {
     let Some(admin_url) = test_url("colliding_long_sources_are_not_treated_as_the_same_fork") else { return };
     let prefix = "c".repeat(62);
