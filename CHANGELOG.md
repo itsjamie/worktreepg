@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0
+
+This release tightens the boundaries around database ownership, filesystem paths, env-file updates, and PostgreSQL endpoints.
+
+- Templates are scoped to both repository and source database, and forks that collide across sources are refused instead of adopted.
+- Derived names keep their identifying suffix at PostgreSQL's identifier limit.
+- Directive, include, source, and target paths cannot escape their worktree through traversal or symlinks.
+- Env-file rewrites preserve concurrent edits and encode database names correctly in URLs.
+- Ambiguous multi-host and multi-port endpoints are rejected, and invalid configuration consistently exits as an environment error.
+- `template create --force` now performs the documented takeover, while failed template drops restore their original flags.
+- `remove` works from a subdirectory and leaves the worktree intact when its source URL is invalid.
+- The README now contains the working essentials without the implementation tour.
+
 ## 0.3.0
 
 Mixed-credential directives work, and a command that cannot finish its work now says which piece it could not do instead of stopping part way through.
