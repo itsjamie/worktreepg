@@ -851,7 +851,7 @@ impl Admin {
     /// offer it to a run it has already been refused for. Anything other than a refusal, a server
     /// that goes away mid-loop, still fails the command.
     fn terminate_backends(&mut self, database: &str) -> Result<Signals> {
-        let sql = "SELECT pid FROM pg_stat_activity WHERE datname = $1 AND backend_type IS DISTINCT FROM 'autovacuum worker' AND pid <> pg_backend_pid()";
+        let sql = "SELECT pid FROM pg_stat_activity WHERE datname = $1 AND backend_type IS DISTINCT FROM 'autovacuum worker' AND pid <> pg_backend_pid() ORDER BY backend_start, pid";
         let pids: Vec<i32> = self.client.query(sql, &[&database])?.iter().map(|row| row.get(0)).collect();
         if pids.is_empty() {
             // Nothing to signal, so the privilege the loop needs is not one this copy needs: an

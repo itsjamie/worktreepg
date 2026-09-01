@@ -163,7 +163,7 @@ impl Db {
     /// The backends `--terminate` signals, in the order it signals them, which is the scan
     /// [`worktreepg::db`] makes before the loop.
     fn scan(&mut self, database: &str) -> Vec<i32> {
-        let sql = "SELECT pid FROM pg_stat_activity WHERE datname = $1 AND backend_type IS DISTINCT FROM 'autovacuum worker' AND pid <> pg_backend_pid()";
+        let sql = "SELECT pid FROM pg_stat_activity WHERE datname = $1 AND backend_type IS DISTINCT FROM 'autovacuum worker' AND pid <> pg_backend_pid() ORDER BY backend_start, pid";
         self.admin.query(sql, &[&database]).unwrap().iter().map(|r| r.get(0)).collect()
     }
 
@@ -388,27 +388,16 @@ fn backend_pid(client: &mut Client) -> i32 {
     client.query_one("SELECT pg_backend_pid()", &[]).unwrap().get(0)
 }
 
-/// A connection to `url` that the scan `--terminate` makes reaches after `first`, the backend the
-/// signal is refused on. A refusal that stopped the scan costs the backends after it and no
-/// others, so a test that a refusal costs nothing but itself is only testing anything where there
-/// is one to lose: the order is asserted here rather than left to how the cluster hands out
-/// backend slots. It hands them out in connection order, so connecting after `first` is normally
-/// enough; a slot another test freed is handed out again ahead of it, and a candidate that lands
-/// there is kept rather than dropped, because holding the slot is what makes the next candidate
-/// land later where dropping it would hand the same slot back.
+/// A connection to `url` that the explicitly start-time-ordered `--terminate` scan reaches after
+/// `first`, the backend the signal is refused on. A regression to terminating the whole set at
+/// once would leave this later backend open.
 fn attached_after(db: &mut Db, database: &str, url: &str, first: i32) -> Client {
-    let mut held = Vec::new();
-    for _ in 0..20 {
-        let mut candidate = Client::connect(url, NoTls).unwrap();
-        let pid = backend_pid(&mut candidate);
-        let scan = db.scan(database);
-        let at = |p: i32| scan.iter().position(|q| *q == p).unwrap_or_else(|| panic!("pid {p} is not in the scan of {database}"));
-        if at(first) < at(pid) {
-            return candidate;
-        }
-        held.push(candidate);
-    }
-    panic!("no connection to {database} landed after pid {first} in the scan --terminate makes");
+    let mut candidate = Client::connect(url, NoTls).unwrap();
+    let pid = backend_pid(&mut candidate);
+    let scan = db.scan(database);
+    let at = |p: i32| scan.iter().position(|q| *q == p).unwrap_or_else(|| panic!("pid {p} is not in the scan of {database}"));
+    assert!(at(first) < at(pid), "connection {pid} did not start after {first}");
+    candidate
 }
 
 /// `--terminate` closes the backends the role can close even where another backend on the same
