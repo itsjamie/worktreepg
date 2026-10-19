@@ -1,7 +1,10 @@
 //! The five commands. Each one works in terms of forks, templates, and worktrees; the SQL,
 //! metadata, and file-format details live in `db`, `envfile`, and `project`.
 
-use crate::db::{self, CopyMethod, ForkOptions, ForkSpec, ForkStatus, Managed, Meta, Origin, Pool, TemplateOptions, TemplateStatus};
+use crate::db::{
+    self, CopyMethod, ForkOptions, ForkSpec, ForkStatus, Managed, Meta, Origin, Owner, Pool, Release, TemplateOptions, TemplateStatus,
+};
+use crate::directives::Share;
 use crate::envfile::EnvFile;
 use crate::errors::{annotated, detail_of, environment, exit_code, is_conflict, usage, EXIT_CONFLICT, EXIT_ENVIRONMENT, EXIT_INTERNAL};
 use crate::git;
@@ -81,19 +84,27 @@ fn restore_a_directive(source: &str, owner: Option<&str>) -> String {
     }
 }
 
-/// Drops the fork, as the first role and then as the one that owns it where a URL on the cluster
-/// connects as that role and the first was refused for want of ownership. Returns the refusal to
-/// report, or `None` where the fork was dropped.
-fn attempt_drop(pool: &mut Pool, source: &str, name: &str, first: &PgUrl, owning: Option<&PgUrl>) -> Result<Option<anyhow::Error>> {
+/// Lets go of `owner`'s share in the fork, as the first role and then as the one that owns the
+/// fork where a URL on the cluster connects as that role and the first was refused for want of
+/// ownership. Dropping the fork and rewriting its comment both need ownership, so either can be
+/// the refusal. Returns what the release came to, or the refusal to report.
+fn attempt_release(
+    pool: &mut Pool,
+    source: &str,
+    name: &str,
+    owner: &Owner,
+    first: &PgUrl,
+    owning: Option<&PgUrl>,
+) -> Result<std::result::Result<Release, anyhow::Error>> {
     let mut refusal = None;
     for url in [Some(first), owning].into_iter().flatten() {
-        match pool.for_database(url, source)?.drop_fork(name, false) {
-            Ok(()) => return Ok(None),
+        match pool.for_database(url, source)?.release_fork(name, &owner.repo, &owner.worktree) {
+            Ok(release) => return Ok(Ok(release)),
             Err(e) if is_not_owner(&e) => refusal = Some(e),
             Err(e) => return Err(e),
         }
     }
-    Ok(Some(refusal.expect("the first URL was attempted")))
+    Ok(Err(refusal.expect("the first URL was attempted")))
 }
 
 /// Whether the server refused a statement because the role does not own the database, which is the
@@ -102,50 +113,62 @@ fn is_not_owner(e: &anyhow::Error) -> bool {
     detail_of(e).is_some_and(|d| d.status == db::NOT_OWNER)
 }
 
-/// Drops one fork a cluster scan turned up, counting it. A drop refused for want of ownership by
-/// every role the directives offer is counted as a skip and reported with the remedy, rather than
-/// failing the command: a fork nothing can drop fails every later run the same way, which leaves
-/// it unreachable by any command, so the run finishes the rest of its work and reports the one
-/// piece it could not do. Returns whether the fork was dropped, because the two callers describe
-/// that in their own words.
-fn drop_scanned(
+/// Lets go of `owner`'s share in one fork a cluster scan turned up, counting what that came to: a
+/// drop where nobody else owns it, a release where worktrees of other repositories still do. A
+/// refusal for want of ownership by every role the directives offer is counted as a skip and
+/// reported with the remedy, rather than failing the command: a fork nothing can drop fails every
+/// later run the same way, which leaves it unreachable by any command, so the run finishes the rest
+/// of its work and reports the one piece it could not do. Returns what the release came to, or
+/// `None` for a skip, because the two callers describe the rest in their own words.
+#[allow(clippy::too_many_arguments)]
+fn release_scanned(
     pool: &mut Pool,
     live: &[PgUrl],
     cluster: &PgUrl,
     fork: &Managed,
+    owner: &Owner,
     dry_run: bool,
     counts: &mut Counts,
     reporter: &mut Reporter,
-) -> Result<bool> {
+) -> Result<Option<Release>> {
     let source = fork.meta.source();
     let first = dropper(live, cluster, source);
-    let owner = pool.for_cluster(cluster)?.owner_of(&fork.name)?;
-    let owning = owner.as_deref().and_then(|owner| owners_url(live, cluster, first, owner));
+    let db_owner = pool.for_cluster(cluster)?.owner_of(&fork.name)?;
+    let owning = db_owner.as_deref().and_then(|role| owners_url(live, cluster, first, role));
 
-    let refused = if dry_run {
+    let outcome = if dry_run {
+        let release = Release::planned(&fork.meta, &owner.repo, &owner.worktree);
         let admin = pool.for_database(first, source)?;
         // A dry run runs no statement, so the refusal it would meet is asked for instead. It only
         // stands where no URL on the cluster connects as the owning role either, since that one is
         // what a real run falls back to.
-        match (&owner, &owning) {
-            (Some(owner), None) => admin.drop_refusal(&fork.name, owner)?,
+        let refusal = match (&db_owner, &owning) {
+            (Some(role), None) => admin.drop_refusal(&fork.name, role, &release)?,
             _ => None,
-        }
+        };
+        refusal.map_or(Ok(release), Err)
     } else {
-        attempt_drop(pool, source, &fork.name, first, owning)?
+        attempt_release(pool, source, &fork.name, owner, first, owning)?
     };
-    let Some(e) = refused else {
-        counts.inc("dropped");
-        return Ok(true);
+    let e = match outcome {
+        Ok(release) => {
+            match release {
+                Release::Dropped => counts.inc("dropped"),
+                Release::Kept { .. } => counts.inc("released"),
+                Release::Untouched => reporter.verbose(format!("gone      {} (another run let go of it first)", fork.name)),
+            }
+            return Ok(Some(release));
+        }
+        Err(e) => e,
     };
 
     counts.inc("skipped");
     let mut action = json!({
         "op": "skip",
         "database": fork.name,
-        "worktree": fork.meta.worktree(),
+        "worktree": owner.worktree,
         "source": source,
-        "owner": owner,
+        "owner": db_owner,
         "status": db::NOT_OWNER,
         "predicted": dry_run,
     });
@@ -154,9 +177,26 @@ fn drop_scanned(
             action[*field] = value.clone();
         }
     }
-    let line = format!("skip      {}{}: {e} {}", fork.name, planned(dry_run), restore_a_directive(source, owner.as_deref()));
+    let line = format!("skip      {}{}: {e} {}", fork.name, planned(dry_run), restore_a_directive(source, db_owner.as_deref()));
     reporter.action_or_warn(action, line);
-    Ok(false)
+    Ok(None)
+}
+
+/// The action and line for a fork kept because worktrees of other repositories still own it.
+/// `why` is what the caller says about the worktree that let go, before the owners that remain.
+fn report_release(reporter: &mut Reporter, fork: &Managed, owner: &Owner, remaining: &[Owner], why: &str, dry_run: bool) {
+    let share = match &fork.meta {
+        Meta::Fork { ownership, .. } => ownership.group().map(str::to_string),
+        Meta::Template { .. } => None,
+    };
+    let still = remaining.iter().map(|o| o.worktree.display().to_string()).collect::<Vec<_>>().join(", ");
+    reporter.action(
+        json!({
+            "op": "release_database", "database": fork.name, "worktree": owner.worktree, "share": share,
+            "remaining": remaining, "status": status(dry_run),
+        }),
+        format!("release   {} ({why}still used by {still}{})", fork.name, if dry_run { ", planned" } else { "" }),
+    );
 }
 
 /// The `--verbose` line about what a fork will cost on disk, once per cluster, taken on the first
@@ -221,6 +261,7 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
     let mut counts = Counts::new(&[
         "matched",
         "created",
+        "joined",
         "template_refreshed",
         "skipped_existing",
         "rewritten",
@@ -243,6 +284,7 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
     let finish = |counts: &mut Counts, reporter: &Reporter, exit: Option<i32>| -> i32 {
         if opts.dry_run {
             counts.rename("created", "create_planned");
+            counts.rename("joined", "join_planned");
             counts.rename("template_refreshed", "template_refresh_planned");
             counts.rename("rewritten", "rewrite_planned");
         }
@@ -286,7 +328,7 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
         by_file.entry(&v.file).or_default().push(v);
     }
 
-    let Plan { targets, names, blocked } = resolve(project, &by_file, &worktree_name, opts.force, &mut counts, reporter)?;
+    let Plan { targets, names, shares, blocked } = resolve(project, &by_file, &worktree_name, opts.force, &mut counts, reporter)?;
     if blocked {
         return Ok(finish(&mut counts, reporter, exit));
     }
@@ -317,6 +359,7 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
             repo: project.repo.clone(),
             worktree: project.target.clone(),
             branch: branch.clone(),
+            share: shares.get(&key).cloned().unwrap_or_default(),
         };
         let fork_opts = ForkOptions { recreate: opts.recreate, terminate: opts.terminate, dry_run: opts.dry_run };
         note_storage(&mut pool, &clusters, &v.url, &mut noted, reporter);
@@ -324,10 +367,23 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
         // keeps the borrow inside the match rather than needing a `?` the loop would return on. A
         // server that goes away mid-run surfaces from the queries inside `ensure_fork`.
         match pool.for_database(&v.url, &v.url.database).and_then(|admin| admin.ensure_fork(&spec, fork_opts)) {
-            Ok(ForkStatus::Forked { from, copy, origin }) => {
+            Ok(ForkStatus::Forked { from, copy, origin, shared_with }) => {
                 counts.inc("created");
                 let st = status(opts.dry_run);
                 let mut action = json!({ "op": "create_database", "database": name, "from": from, "copy": copy.as_str(), "status": st });
+                if let Some(group) = spec.share.group() {
+                    action["share"] = json!(group);
+                }
+                // Only a --recreate gets here with other owners, and it has replaced their data
+                // as well as this worktree's, which is worth a line of its own to whoever reads.
+                if !shared_with.is_empty() {
+                    reporter.warn(format!(
+                        "{name} is shared, so {} the data of {} too",
+                        if opts.dry_run { "recreating it would replace" } else { "recreating it replaced" },
+                        shared_with.iter().map(|o| o.worktree.display().to_string()).collect::<Vec<_>>().join(", ")
+                    ));
+                    action["shared_with"] = json!(shared_with);
+                }
                 // The age is read once so the JSON action and the fallback warning below cannot
                 // disagree across a second boundary. Both snapshot keys describe when {from} was
                 // taken, not when this fork was created, which is what list's created_at means.
@@ -383,6 +439,14 @@ pub fn apply(project: &Project, opts: &ApplyOptions, reporter: &mut Reporter) ->
                         ));
                     }
                 }
+            }
+            Ok(ForkStatus::Joined { group, shared_with }) => {
+                counts.inc("joined");
+                let with = shared_with.iter().map(|o| o.worktree.display().to_string()).collect::<Vec<_>>().join(", ");
+                reporter.action(
+                    json!({ "op": "join_database", "database": name, "share": group, "shared_with": shared_with, "status": status(opts.dry_run) }),
+                    format!("join      {name} (share={group}, with {with}){}", planned(opts.dry_run)),
+                );
             }
             Ok(ForkStatus::Exists) => {
                 counts.inc("skipped_existing");
@@ -512,6 +576,9 @@ struct Plan<'a> {
     /// Fork name per live database, keyed by [`PgUrl::database_key`]. Every database the run's
     /// variables name has an entry unless `blocked`.
     names: HashMap<String, String>,
+    /// The `share=` group per live database, keyed the same way, for the databases a directive
+    /// names one for. The rest are private.
+    shares: HashMap<String, Share>,
     /// A conflict or an error was reported, so nothing may be created and no file may be written.
     blocked: bool,
 }
@@ -529,7 +596,7 @@ fn resolve<'a>(
     counts: &mut Counts,
     reporter: &mut Reporter,
 ) -> Result<Plan<'a>> {
-    let mut plan = Plan { targets: Vec::new(), names: HashMap::new(), blocked: false };
+    let mut plan = Plan { targets: Vec::new(), names: HashMap::new(), shares: HashMap::new(), blocked: false };
     let mut opened = Vec::new();
     for (&file, file_vars) in by_file {
         let path = contained_path(&project.target, Path::new(file))
@@ -542,6 +609,24 @@ fn resolve<'a>(
         }
         let env = EnvFile::open(&path).with_context(|| format!("cannot read {}", path.display()))?;
         opened.push((file, file_vars, env));
+    }
+
+    // A database is shared when any directive naming it says so, so a repository listing it twice
+    // for two roles needs the group once. Two different groups for one database have no meaning
+    // to pick from, and are refused while nothing exists.
+    for v in by_file.values().flatten() {
+        let Share::Group(group) = &v.share else { continue };
+        match plan.shares.get(&v.url.database_key()) {
+            Some(Share::Group(other)) if other != group => {
+                return Err(environment(format!(
+                    "the directives name database \"{}\" with share={other} and share={group}; one database takes one share group",
+                    v.url.database
+                )))
+            }
+            _ => {
+                plan.shares.insert(v.url.database_key(), v.share.clone());
+            }
+        }
     }
 
     let mut tried: HashSet<String> = HashSet::new();
@@ -599,7 +684,8 @@ pub struct RemoveOptions {
     pub force: bool,
 }
 
-/// Removes a worktree and drops the forks made for it. Every database the directives name is
+/// Removes a worktree and lets go of its forks: a fork it owned alone is dropped, and a fork
+/// worktrees of other repositories share is kept for them, without this one. Every database the directives name is
 /// connected to before anything is touched, so a server that cannot be reached fails the
 /// command while the worktree is still there to re-run it against; the price is that a
 /// directive naming a cluster that is gone for good blocks `remove` until the directive or the
@@ -617,7 +703,7 @@ pub fn remove(project: &Project, opts: &RemoveOptions, reporter: &mut Reporter) 
         return Err(usage(format!("{} is the source worktree; refusing to remove it", target.display())));
     }
     let registered = git::living_worktrees(&project.cwd)?.contains(&target);
-    let mut counts = Counts::new(&["worktree_removed", "dropped", "skipped"]);
+    let mut counts = Counts::new(&["worktree_removed", "dropped", "released", "skipped"]);
     let doc = document(vec![("dry_run", json!(opts.dry_run)), ("worktree", json!(target))]);
 
     // Every database the directives name, not only the ones holding a fork of this worktree:
@@ -650,15 +736,15 @@ pub fn remove(project: &Project, opts: &RemoveOptions, reporter: &mut Reporter) 
 
     for cluster in &clusters(&vars) {
         for fork in pool.for_cluster(cluster)?.forks_for(&project.repo)? {
-            let Meta::Fork { worktree, .. } = &fork.meta else { continue };
-            if worktree != &target {
-                continue;
-            }
-            if drop_scanned(&mut pool, &live, cluster, &fork, opts.dry_run, &mut counts, reporter)? {
-                reporter.action(
-                    json!({ "op": "drop_database", "database": fork.name, "worktree": worktree, "status": status(opts.dry_run) }),
+            let Meta::Fork { ownership, .. } = &fork.meta else { continue };
+            let Some(owner) = ownership.of(&project.repo).filter(|o| o.worktree == target).cloned() else { continue };
+            match release_scanned(&mut pool, &live, cluster, &fork, &owner, opts.dry_run, &mut counts, reporter)? {
+                Some(Release::Dropped) => reporter.action(
+                    json!({ "op": "drop_database", "database": fork.name, "worktree": owner.worktree, "status": status(opts.dry_run) }),
                     format!("drop      {}{}", fork.name, planned(opts.dry_run)),
-                );
+                ),
+                Some(Release::Kept { remaining }) => report_release(reporter, &fork, &owner, &remaining, "", opts.dry_run),
+                Some(Release::Untouched) | None => {}
             }
         }
     }
@@ -666,31 +752,41 @@ pub fn remove(project: &Project, opts: &RemoveOptions, reporter: &mut Reporter) 
     Ok(if counts.get("skipped") > 0 { EXIT_ENVIRONMENT } else { 0 })
 }
 
-/// Drops every fork whose worktree git no longer lists: the catch-up after a plain `git worktree
-/// remove`, and the way back for a fork an earlier `remove` had to skip. One it still cannot drop
+/// Lets go of every fork whose worktree git no longer lists, the way `remove` does: the catch-up
+/// after a plain `git worktree remove`, and the way back for a fork an earlier `remove` had to
+/// skip. Only this repository's worktrees are weighed, since another's is its own git to ask. One it still cannot drop
 /// is skipped again rather than stopping the run, so the forks after it are not held up by it.
 pub fn prune(project: &Project, dry_run: bool, reporter: &mut Reporter) -> Result<i32> {
     project.require_directives()?;
     let living: HashSet<PathBuf> = git::living_worktrees(&project.cwd)?.into_iter().collect();
-    let mut counts = Counts::new(&["forks", "dropped", "kept", "skipped"]);
+    let mut counts = Counts::new(&["forks", "dropped", "released", "kept", "skipped"]);
     let (vars, problems) = project.env_vars()?;
     let invalid_url = warn_all(&problems, reporter);
     let mut pool = Pool::new(vars.iter().map(|v| &v.url));
     let live = databases(&vars);
     for cluster in &clusters(&vars) {
         for fork in pool.for_cluster(cluster)?.forks_for(&project.repo)? {
-            let Meta::Fork { worktree, .. } = &fork.meta else { continue };
+            let Meta::Fork { ownership, .. } = &fork.meta else { continue };
+            // Only this repository's own worktree is weighed: whether another repository's is
+            // still alive is that repository's git to say, and its own prune lets go of it.
+            let Some(owner) = ownership.of(&project.repo).cloned() else { continue };
+            let worktree = &owner.worktree;
             counts.inc("forks");
             if living.contains(worktree) {
                 counts.inc("kept");
                 reporter.verbose(format!("keep      {} ({})", fork.name, worktree.display()));
                 continue;
             }
-            if drop_scanned(&mut pool, &live, cluster, &fork, dry_run, &mut counts, reporter)? {
-                reporter.action(
+            match release_scanned(&mut pool, &live, cluster, &fork, &owner, dry_run, &mut counts, reporter)? {
+                Some(Release::Dropped) => reporter.action(
                     json!({ "op": "drop_database", "database": fork.name, "worktree": worktree, "status": status(dry_run) }),
                     format!("drop      {} (worktree {} is gone{})", fork.name, worktree.display(), if dry_run { ", planned" } else { "" }),
-                );
+                ),
+                Some(Release::Kept { remaining }) => {
+                    let why = format!("worktree {} is gone; ", worktree.display());
+                    report_release(reporter, &fork, &owner, &remaining, &why, dry_run);
+                }
+                Some(Release::Untouched) | None => {}
             }
         }
     }
@@ -709,25 +805,34 @@ pub fn list(project: &Project, all: bool, reporter: &mut Reporter) -> Result<i32
     for cluster in &clusters(&vars) {
         let server = cluster.server();
         for m in pool.for_cluster(cluster)?.list_managed()? {
-            if !all && m.meta.repo() != project.repo {
+            if !all && !m.meta.belongs_to(&project.repo) {
                 continue;
             }
             match &m.meta {
-                Meta::Template { .. } => {
+                Meta::Template { repo, .. } => {
                     reporter.info(format!("template  {}  from {}  refreshed {}", m.name, m.meta.source(), m.meta.created_at()));
-                    rows.push(json!({ "server": server, "database": m.name, "kind": "template", "source": m.meta.source(), "repo": m.meta.repo(), "created_at": m.meta.created_at() }));
+                    rows.push(json!({ "server": server, "database": m.name, "kind": "template", "source": m.meta.source(), "repo": repo, "created_at": m.meta.created_at() }));
                 }
-                Meta::Fork { worktree, branch, template, .. } => {
-                    let present = living.contains(worktree);
+                Meta::Fork { template, ownership, .. } => {
+                    // The row speaks for this repository's worktree where it owns one, so `repo`,
+                    // `worktree` and `worktree_exists` mean what they did before forks were shared;
+                    // `owners` lists every worktree, of this repository or another.
+                    let owner = ownership.of(&project.repo).unwrap_or(&ownership.owners()[0]);
+                    let present = living.contains(&owner.worktree);
+                    let shared = match ownership.group() {
+                        Some(group) => format!("  (share={group}, {} owners)", ownership.owners().len()),
+                        None => String::new(),
+                    };
                     reporter.info(format!(
-                        "fork      {}  {}{}",
+                        "fork      {}  {}{shared}{}",
                         m.name,
-                        worktree.display(),
+                        owner.worktree.display(),
                         if present { "" } else { "  (worktree missing, run prune)" }
                     ));
                     rows.push(json!({
                         "server": server, "database": m.name, "kind": "fork", "source": m.meta.source(), "template": template,
-                        "repo": m.meta.repo(), "worktree": worktree, "branch": branch, "worktree_exists": present, "created_at": m.meta.created_at(),
+                        "repo": owner.repo, "worktree": owner.worktree, "branch": owner.branch, "worktree_exists": present, "created_at": m.meta.created_at(),
+                        "share": ownership.group(), "owners": ownership.owners(),
                     }));
                 }
             }

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+Repositories that point at one development database can share one fork, which is what a workerbox worker spanning several repositories wants.
+
+A directive that names a group, as in `# worktreepg: .env DATABASE_URL share=shop`, lets the fork it makes be joined by a worktree of another repository whose directive names the same group, and lets it join one. The token can go anywhere in the directive and works with every existing form. Both sides have to opt in: a fork created without a group is refused exactly as before, a directive without a group cannot join one, and a group admits only directives that name it. The refusal now names the other repository's worktree and says which directive needs `share=`. A shared fork records every worktree that uses it, at most one per repository, so two worktrees of one repository whose names collide are still refused. A fork's only owner can add, change, or remove its group by re-running `apply`, which is how a fork created before its repository named a group becomes joinable.
+
+`remove` and `prune` release this repository's worktree from a shared fork and drop the fork only when no worktree is left. `prune` considers only this repository's worktrees; another repository's dead worktree is released by that repository's own `prune`. `apply --recreate` on a shared fork replaces it for every worktree that uses it, keeps them all as owners, and says on stderr whose data it replaced.
+
+Every run that creates, joins, recreates, releases, or drops a fork holds a Postgres advisory lock on the fork's name while it decides and acts. Two applies that want one fork therefore take turns: the second waits for the first's clone and then joins it, rather than failing on `CREATE DATABASE` or reading a fork with no comment yet as foreign. A join and the last release are serialized the same way, so the release cannot drop a fork that a join has just recorded itself on.
+
+### Worth knowing before upgrading
+
+- A fork with one owner and no group is still written in the format 0.4 reads. A shared fork uses format 2 of the comment, which 0.4 reads as a database it did not create, so it neither adopts nor drops the fork.
+- `apply` reports `joined` (`join_planned` in a dry run) and a `join_database` action. `remove` and `prune` report `released` and a `release_database` action. `list` rows gain `share` and `owners`; their `repo`, `worktree`, and `worktree_exists` describe this repository's worktree.
+
 ## 0.4.0
 
 This release tightens the boundaries around database ownership, filesystem paths, env-file updates, and PostgreSQL endpoints.

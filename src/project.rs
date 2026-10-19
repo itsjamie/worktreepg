@@ -1,7 +1,7 @@
 //! What a repository has configured: where the source and target worktrees are, which
 //! `.worktreeinclude` directives apply, and which Postgres databases those directives name.
 
-use crate::directives::{parse_directives, Directive};
+use crate::directives::{parse_directives, Directive, Share};
 use crate::envfile::EnvFile;
 use crate::errors::{environment, usage};
 use crate::git;
@@ -31,6 +31,8 @@ pub struct EnvVar {
     pub file: String,
     pub name: String,
     pub url: PgUrl,
+    /// The directive's `share=` group, which decides whether the fork may join other repositories'.
+    pub share: Share,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +110,7 @@ impl Project {
                     continue;
                 };
                 match PgUrl::parse(&value) {
-                    Ok(url) => vars.push(EnvVar { file: directive.file.clone(), name: name.clone(), url }),
+                    Ok(url) => vars.push(EnvVar { file: directive.file.clone(), name: name.clone(), url, share: directive.share.clone() }),
                     Err(e) => problems.push(Problem {
                         file: directive.file.clone(),
                         name: Some(name.clone()),
