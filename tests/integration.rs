@@ -1381,3 +1381,381 @@ fn a_fork_no_directive_reaches_is_skipped_rather_than_stopping_the_run() {
     db.drop_role("orphan_ra");
     db.drop_role("orphan_rb");
 }
+
+/// A repository called `name` whose `.worktreeinclude` holds `directive`, with a source `.env`
+/// pointing DATABASE_URL at `live_url`, and a worktree `<name>-w1` with that `.env` copied in, the
+/// way workerbox lays out one worker across a workspace of repositories. Returns the repository
+/// root and the worktree.
+fn member(root: &Path, name: &str, directive: &str, live_url: &str) -> (PathBuf, PathBuf) {
+    let repo = root.join(name);
+    fs::create_dir(&repo).unwrap();
+    git(&["init", "-q", "-b", "main"], &repo);
+    fs::write(repo.join(".gitignore"), ".env\n.worktreeinclude\n").unwrap();
+    fs::write(repo.join(".worktreeinclude"), format!("{directive}\n.env\n")).unwrap();
+    let env = format!("DATABASE_URL=\"{live_url}\"\n");
+    fs::write(repo.join(".env"), &env).unwrap();
+    fs::write(repo.join("README.md"), format!("{name}\n")).unwrap();
+    git(&["add", "."], &repo);
+    git(&["commit", "-q", "-m", "init"], &repo);
+    let worktree = root.join(format!("{name}-w1"));
+    git(&["worktree", "add", "-q", worktree.to_str().unwrap(), "-b", "w1"], &repo);
+    fs::write(worktree.join(".env"), &env).unwrap();
+    (repo, worktree)
+}
+
+fn directive(repo: &Path, directive: &str) {
+    fs::write(repo.join(".worktreeinclude"), format!("{directive}\n.env\n")).unwrap();
+}
+
+/// The worktrees a fork's comment records as its owners, in order.
+fn owners(db: &mut Db, name: &str) -> Vec<String> {
+    let meta = db.meta(name);
+    match meta["v"].as_u64() {
+        Some(1) => vec![meta["worktree"].as_str().unwrap().to_string()],
+        _ => meta["owners"].as_array().unwrap().iter().map(|o| o["worktree"].as_str().unwrap().to_string()).collect(),
+    }
+}
+
+fn action<'a>(r: &'a Run, op: &str) -> &'a Value {
+    let actions = r.json["actions"].as_array().unwrap_or_else(|| panic!("no actions in {}\n{}", r.stdout, r.stderr));
+    actions.iter().find(|a| a["op"] == op).unwrap_or_else(|| panic!("no {op} action in {}", r.stdout))
+}
+
+/// Two repositories pointing at one development database, forked under one worktree name, the way
+/// a workerbox worker spans a workspace. With `share=` naming one group in both directives the
+/// second joins the first's fork rather than being refused, and the fork outlives whichever of
+/// them lets go first: `remove` and `prune` from one repository release its worktree, and only the
+/// last owner's drop drops the database.
+#[test]
+fn two_repositories_naming_one_group_share_one_fork() {
+    let Some(admin_url) = test_url("two_repositories_naming_one_group_share_one_fork") else { return };
+    let mut db = Db::connect(&admin_url, "shr");
+    db.client("shr").batch_execute("CREATE TABLE things (name text PRIMARY KEY); INSERT INTO things VALUES ('one')").unwrap();
+    db.wait_idle("shr");
+    let root = tempfile::tempdir().unwrap();
+    let root: PathBuf = root.path().canonicalize().unwrap();
+    let shared = "# worktreepg: .env DATABASE_URL share=shop";
+    let (api, api_w1) = member(&root, "api", shared, &db.url("shr"));
+    let (web, web_w1) = member(&root, "web", shared, &db.url("shr"));
+    let (jobs, jobs_w1) = member(&root, "jobs", shared, &db.url("shr"));
+    let wt = |p: &Path| p.to_str().unwrap().to_string();
+
+    let r = run(&["apply", "--worktree-name", "w1"], &api_w1, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 1);
+    assert_eq!(action(&r, "create_database")["share"], "shop");
+    assert_eq!(db.meta("shr_w1")["v"], 2, "a fork made under a group is written in the format 0.4 cannot mistake for its own");
+
+    // the second repository joins rather than conflicting, and points its app at the same database
+    let r = run(&["apply", "--worktree-name", "w1"], &web_w1, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "created"), 0);
+    assert_eq!(summary(&r, "joined"), 1);
+    assert_eq!(summary(&r, "rewritten"), 1);
+    let join = action(&r, "join_database");
+    assert_eq!(join["share"], "shop");
+    assert_eq!(join["shared_with"][0]["worktree"], wt(&api_w1));
+    assert_eq!(env_database(&web_w1), "shr_w1");
+    assert_eq!(owners(&mut db, "shr_w1"), [wt(&api_w1), wt(&web_w1)]);
+    db.client("shr_w1").batch_execute("INSERT INTO things VALUES ('two')").unwrap();
+
+    // and re-running in either is the usual no-op
+    let r = run(&["apply", "--worktree-name", "w1"], &web_w1, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "skipped_existing"), 1);
+    assert_eq!(summary(&r, "joined"), 0);
+
+    // a dry run plans the join, under the dry run's own counter name, and records nothing
+    let r = run(&["apply", "--worktree-name", "w1", "--dry-run"], &jobs_w1, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "join_planned"), 1);
+    assert_eq!(summary(&r, "rewrite_planned"), 1);
+    assert_eq!(action(&r, "join_database")["status"], "planned");
+    assert_eq!(owners(&mut db, "shr_w1").len(), 2);
+    assert_eq!(env_database(&jobs_w1), "shr");
+
+    // list speaks for this repository's worktree, and names every owner
+    let r = run(&["list"], &web, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    let row = &r.json["databases"][0];
+    assert_eq!(row["worktree"], wt(&web_w1));
+    assert_eq!(row["worktree_exists"], true);
+    assert_eq!(row["share"], "shop");
+    assert_eq!(row["owners"].as_array().unwrap().len(), 2);
+    let r = run(&["list"], &web, false);
+    assert!(r.stdout.contains("(share=shop, 2 owners)"), "{}", r.stdout);
+
+    // remove in one repository lets go of the fork without dropping it from under the other,
+    // which is what workerbox's `down` runs in each repository in turn
+    let r = run(&["remove", "--keep-worktree", "--dry-run"], &api_w1, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "released"), 1);
+    assert_eq!(summary(&r, "dropped"), 0);
+    assert_eq!(owners(&mut db, "shr_w1").len(), 2, "a dry run records nothing");
+    let r = run(&["remove", "--keep-worktree"], &api_w1, false);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains(&format!("release   shr_w1 (still used by {})", wt(&web_w1))), "{}", r.stdout);
+    assert!(r.stdout.contains("dropped=0 released=1"), "{}", r.stdout);
+    assert_eq!(owners(&mut db, "shr_w1"), [wt(&web_w1)]);
+    assert_eq!(db.things("shr_w1"), ["one", "two"], "the fork and its data are still there");
+
+    // the repository that let go has nothing left to prune, and can join again
+    let r = run(&["prune"], &api, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "forks"), 0);
+    let r = run(&["apply", "--worktree-name", "w1"], &api_w1, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "joined"), 1);
+    assert_eq!(summary(&r, "skipped_same"), 1);
+
+    // prune lets go of a worktree removed with plain git, and keeps the fork for the one alive
+    git(&["worktree", "remove", "--force", &wt(&api_w1)], &api);
+    let r = run(&["prune"], &api, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "released"), 1);
+    assert_eq!(summary(&r, "dropped"), 0);
+    let release = action(&r, "release_database");
+    assert_eq!(release["worktree"], wt(&api_w1));
+    assert_eq!(release["remaining"][0]["worktree"], wt(&web_w1));
+    assert!(db.exists("shr_w1"));
+    // and prune in the repository whose worktree is alive keeps it
+    let r = run(&["prune"], &web, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "kept"), 1);
+
+    // the last owner's remove drops it
+    let r = run(&["remove", &wt(&web_w1)], &web, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "worktree_removed"), 1);
+    assert_eq!(summary(&r, "dropped"), 1);
+    assert_eq!(summary(&r, "released"), 0);
+    assert!(!db.exists("shr_w1"));
+
+    git(&["worktree", "remove", "--force", &wt(&jobs_w1)], &jobs);
+    db.admin.batch_execute("DROP DATABASE \"shr\" WITH (FORCE)").unwrap();
+}
+
+/// Sharing takes a directive on both sides naming one group. A fork made without a group, or a
+/// directive without one, is the refusal it always was, and the message says what to add where.
+/// A fork's only owner sets its terms alone, which is how a fork made before its repository named
+/// a group becomes joinable; once another repository has joined, neither can take it private.
+#[test]
+fn a_fork_is_shared_only_when_both_directives_opt_in() {
+    let Some(admin_url) = test_url("a_fork_is_shared_only_when_both_directives_opt_in") else { return };
+    let mut db = Db::connect(&admin_url, "optin");
+    let root = tempfile::tempdir().unwrap();
+    let root: PathBuf = root.path().canonicalize().unwrap();
+    let private = "# worktreepg: .env DATABASE_URL";
+    let (api, api_w1) = member(&root, "api", private, &db.url("optin"));
+    let (web, web_w1) = member(&root, "web", "# worktreepg: .env DATABASE_URL share=shop", &db.url("optin"));
+    let wt = |p: &Path| p.to_str().unwrap().to_string();
+
+    let r = run(&["apply", "--worktree-name", "w1"], &api_w1, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(db.meta("optin_w1")["v"], 1, "a fork with no group is written the way 0.4 reads it");
+
+    // the fork's own directive did not opt in, so naming a group on this side is not enough
+    let r = run(&["apply", "--worktree-name", "w1"], &web_w1, true);
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    assert_eq!(summary(&r, "conflicts"), 1);
+    assert_eq!(summary(&r, "rewritten"), 0);
+    let conflict = action(&r, "conflict");
+    assert_eq!(conflict["status"], "unmanaged", "the status 0.4 reported for a fork of another repository");
+    assert_eq!(conflict["worktree"], wt(&api_w1));
+    let r = run(&["apply", "--worktree-name", "w1"], &web_w1, false);
+    assert!(r.stdout.contains(&format!("add share=shop to it and re-run apply in {}", wt(&api_w1))), "{}", r.stdout);
+    assert_eq!(env_database(&web_w1), "optin");
+
+    // and neither is opting in on that side alone
+    directive(&web, private);
+    directive(&api, "# worktreepg: .env DATABASE_URL share=shop");
+    let r = run(&["apply", "--worktree-name", "w1"], &api_w1, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "skipped_existing"), 1);
+    assert_eq!(db.meta("optin_w1")["share"], "shop", "the only owner regrouped its fork");
+    let r = run(&["apply", "--worktree-name", "w1"], &web_w1, false);
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    assert!(r.stdout.contains("this directive names no share group. Add share=shop to it to join"), "{}", r.stdout);
+
+    // a group only admits directives naming the same one
+    directive(&web, "# worktreepg: .env DATABASE_URL share=other");
+    let r = run(&["apply", "--worktree-name", "w1"], &web_w1, true);
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    assert_eq!(action(&r, "conflict")["status"], "other_group");
+    assert_eq!(action(&r, "conflict")["share"], "shop");
+
+    // with both naming it, the second joins
+    directive(&web, "# worktreepg: .env DATABASE_URL share=shop");
+    let r = run(&["apply", "--worktree-name", "w1"], &web_w1, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "joined"), 1);
+
+    // and once it is shared, neither can take it private or into another group by itself
+    directive(&api, private);
+    let r = run(&["apply", "--worktree-name", "w1"], &api_w1, true);
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    assert_eq!(action(&r, "conflict")["status"], "shared");
+    let r = run(&["apply", "--worktree-name", "w1"], &api_w1, false);
+    assert!(r.stdout.contains("put share=shop back"), "{}", r.stdout);
+    directive(&api, "# worktreepg: .env DATABASE_URL share=other");
+    let r = run(&["apply", "--worktree-name", "w1"], &api_w1, true);
+    assert_eq!(r.code, 3, "{}", r.stderr);
+    assert_eq!(action(&r, "conflict")["status"], "other_group");
+    assert_eq!(owners(&mut db, "optin_w1"), [wt(&api_w1), wt(&web_w1)]);
+
+    // two directives giving one database two groups is a mistake to fix, not a choice to make
+    fs::write(
+        api.join(".worktreeinclude"),
+        "# worktreepg: .env DATABASE_URL share=shop\n# worktreepg: .env DATABASE_URL share=other\n.env\n",
+    )
+    .unwrap();
+    let r = run(&["apply", "--worktree-name", "w1"], &api_w1, true);
+    assert_eq!(r.code, 4, "{}", r.stderr);
+    assert!(r.stderr.contains("one database takes one share group"), "{}", r.stderr);
+
+    for (repo, worktree) in [(&api, &api_w1), (&web, &web_w1)] {
+        git(&["worktree", "remove", "--force", &wt(worktree)], repo);
+    }
+    for name in ["optin_w1", "optin"] {
+        db.admin.batch_execute(&format!("DROP DATABASE \"{name}\" WITH (FORCE)")).unwrap();
+    }
+}
+
+/// `--recreate` on a shared fork re-clones it for every owner, and keeps them all as owners: they
+/// asked for one database, so the replacement is theirs too, and the run says whose data it
+/// replaced.
+#[test]
+fn recreating_a_shared_fork_replaces_it_for_every_owner() {
+    let Some(admin_url) = test_url("recreating_a_shared_fork_replaces_it_for_every_owner") else { return };
+    let mut db = Db::connect(&admin_url, "recr");
+    db.client("recr").batch_execute("CREATE TABLE things (name text PRIMARY KEY); INSERT INTO things VALUES ('one')").unwrap();
+    db.wait_idle("recr");
+    let root = tempfile::tempdir().unwrap();
+    let root: PathBuf = root.path().canonicalize().unwrap();
+    let shared = "# worktreepg: .env DATABASE_URL share=shop";
+    let (api, api_w1) = member(&root, "api", shared, &db.url("recr"));
+    let (web, web_w1) = member(&root, "web", shared, &db.url("recr"));
+    let wt = |p: &Path| p.to_str().unwrap().to_string();
+    for worktree in [&api_w1, &web_w1] {
+        let r = run(&["apply", "--worktree-name", "w1"], worktree, true);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+    }
+    db.client("recr_w1").batch_execute("INSERT INTO things VALUES ('api wrote this')").unwrap();
+    db.wait_idle("recr_w1");
+
+    let r = run(&["apply", "--worktree-name", "w1", "--recreate"], &web_w1, false);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.contains("created=1"), "{}", r.stdout);
+    assert!(r.stderr.contains(&format!("recr_w1 is shared, so recreating it replaced the data of {} too", wt(&api_w1))), "{}", r.stderr);
+    assert_eq!(db.things("recr_w1"), ["one"]);
+    assert_eq!(owners(&mut db, "recr_w1"), [wt(&api_w1), wt(&web_w1)], "every owner keeps its share");
+
+    db.wait_idle("recr_w1");
+    let r = run(&["apply", "--worktree-name", "w1", "--recreate"], &api_w1, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(action(&r, "create_database")["shared_with"][0]["worktree"], wt(&web_w1));
+
+    for (repo, worktree) in [(&api, &api_w1), (&web, &web_w1)] {
+        git(&["worktree", "remove", "--force", &wt(worktree)], repo);
+    }
+    for name in ["recr_w1", "recr"] {
+        db.admin.batch_execute(&format!("DROP DATABASE \"{name}\" WITH (FORCE)")).unwrap();
+    }
+}
+
+fn spawn(args: &[&str], cwd: &Path) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_git-worktreepg"))
+        .args(args)
+        .arg("--json")
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn worktreepg")
+}
+
+fn finished(child: std::process::Child) -> Run {
+    let out = child.wait_with_output().expect("wait for worktreepg");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let json = serde_json::from_str(&stdout).unwrap_or(Value::Null);
+    Run { code: out.status.code().unwrap_or(-1), stdout, stderr, json }
+}
+
+/// Waits until `n` sessions are queued behind the fork's advisory lock, which the test holds.
+fn wait_for_waiters(db: &mut Db, fork: &str, n: i64) {
+    let (namespace, key) = worktreepg::db::fork_lock(fork);
+    let sql = "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND classid::bigint = $1 AND objid::bigint = $2 AND objsubid = 2 AND NOT granted";
+    for _ in 0..200 {
+        let row = db.admin.query_one(sql, &[&i64::from(namespace as u32), &i64::from(key as u32)]).unwrap();
+        if row.get::<_, i64>(0) == n {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("{n} runs never queued on the lock for {fork}");
+}
+
+/// Two applies that want one fork take turns on its advisory lock rather than racing each other
+/// to `CREATE DATABASE`: the test holds the lock so both are queued behind it at once, which is
+/// the closest two runs can come, and lets them go. One creates the fork and the other joins it,
+/// whichever order the lock hands them out in. A remove queued ahead of a join is the other race
+/// the lock settles: the remove drops a fork whose last owner it was, and the join, reading the
+/// fork again once it holds the lock, finds it gone and makes a new one rather than recording
+/// itself on a database that no longer exists.
+#[test]
+fn concurrent_runs_on_one_fork_take_turns() {
+    let Some(admin_url) = test_url("concurrent_runs_on_one_fork_take_turns") else { return };
+    let mut db = Db::connect(&admin_url, "race");
+    let root = tempfile::tempdir().unwrap();
+    let root: PathBuf = root.path().canonicalize().unwrap();
+    let shared = "# worktreepg: .env DATABASE_URL share=shop";
+    let (api, api_w1) = member(&root, "api", shared, &db.url("race"));
+    let (web, web_w1) = member(&root, "web", shared, &db.url("race"));
+    let wt = |p: &Path| p.to_str().unwrap().to_string();
+    let (namespace, key) = worktreepg::db::fork_lock("race_w1");
+    // WORKTREE_PG_TEST_URL is a maintenance database, which is where worktreepg's admin
+    // connections take the lock: advisory locks belong to the database a session is on.
+    let lock = |db: &mut Db| db.admin.execute("SELECT pg_advisory_lock($1, $2)", &[&namespace, &key]).unwrap();
+    let unlock = |db: &mut Db| db.admin.execute("SELECT pg_advisory_unlock($1, $2)", &[&namespace, &key]).unwrap();
+
+    lock(&mut db);
+    let first = spawn(&["apply", "--worktree-name", "w1"], &api_w1);
+    let second = spawn(&["apply", "--worktree-name", "w1"], &web_w1);
+    wait_for_waiters(&mut db, "race_w1", 2);
+    assert!(!db.exists("race_w1"), "neither run gets past the lock while it is held");
+    unlock(&mut db);
+    let (first, second) = (finished(first), finished(second));
+    for r in [&first, &second] {
+        assert_eq!(r.code, 0, "{}\n{}", r.stdout, r.stderr);
+    }
+    assert_eq!(summary(&first, "created") + summary(&second, "created"), 1);
+    assert_eq!(summary(&first, "joined") + summary(&second, "joined"), 1);
+    let mut recorded = owners(&mut db, "race_w1");
+    recorded.sort();
+    assert_eq!(recorded, [wt(&api_w1), wt(&web_w1)], "neither owner was lost to the other's write");
+
+    // the remove's release is queued ahead of the join, and api is made the last owner first
+    let r = run(&["remove", "--keep-worktree"], &web_w1, true);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(summary(&r, "released"), 1);
+    lock(&mut db);
+    let remove = spawn(&["remove", "--keep-worktree"], &api_w1);
+    wait_for_waiters(&mut db, "race_w1", 1);
+    let join = spawn(&["apply", "--worktree-name", "w1"], &web_w1);
+    wait_for_waiters(&mut db, "race_w1", 2);
+    unlock(&mut db);
+    let (remove, join) = (finished(remove), finished(join));
+    assert_eq!(remove.code, 0, "{}\n{}", remove.stdout, remove.stderr);
+    assert_eq!(summary(&remove, "dropped"), 1);
+    assert_eq!(join.code, 0, "{}\n{}", join.stdout, join.stderr);
+    assert_eq!(summary(&join, "created"), 1, "the join found the fork gone and made it again: {}", join.stdout);
+    assert_eq!(owners(&mut db, "race_w1"), [wt(&web_w1)]);
+
+    for (repo, worktree) in [(&api, &api_w1), (&web, &web_w1)] {
+        git(&["worktree", "remove", "--force", &wt(worktree)], repo);
+    }
+    for name in ["race_w1", "race"] {
+        db.admin.batch_execute(&format!("DROP DATABASE \"{name}\" WITH (FORCE)")).unwrap();
+    }
+}

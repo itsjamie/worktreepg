@@ -75,6 +75,16 @@ git worktreepg remove ../app-auth
 
 If the worktree was removed with plain Git, clean up its databases with `git worktreepg prune`.
 
+## Sharing a fork across repositories
+
+Two repositories that point at one development database and run `apply --worktree-name` with the same name, such as the repositories of one [workerbox](https://github.com/itsjamie/workerbox) worker, want the same fork. By default the second is refused. To share the fork instead, name one group in each repository's directive:
+
+```gitignore
+# worktreepg: .env DATABASE_URL share=shop
+```
+
+The second `apply` joins the fork the first created. Both directives must name the same group: a fork created without a group cannot be joined, and a directive without one cannot join. `remove` and `prune` in one repository release that repository's worktree, and the fork is dropped when its last worktree releases it. `apply --recreate` replaces a shared fork for every worktree that uses it. Older versions of worktreepg treat a shared fork as a database they did not create.
+
 ## Commands
 
 ```text
@@ -93,7 +103,7 @@ Useful behavior:
 - `apply --force` overwrites a variable that points somewhere other than its source or fork. Without it, the run stops before creating anything.
 - `remove` lets Git reject a dirty or locked worktree before dropping any database. `--keep-worktree` drops only the databases.
 - Fork names use the full branch name, lowercase it, and replace non-alphanumeric runs with `_`. Use `--worktree-name` to resolve a collision.
-- Managed databases carry a `worktreepg` JSON comment, so `remove` and `prune` ignore databases the tool did not create for this repository.
+- Managed databases carry a `worktreepg` JSON comment, so `remove` and `prune` ignore databases the tool did not create for this repository. Runs that change one fork take turns on a Postgres advisory lock.
 - Exit codes are `0` success, `1` internal error, `2` usage error, `3` conflict, and `4` environment or prerequisite error.
 
 On Postgres 18, `--verbose` reports whether the server and filesystem can use copy-on-write clones. Native APFS on macOS can; Docker Desktop's ext4 volume cannot.

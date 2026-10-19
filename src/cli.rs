@@ -33,6 +33,7 @@ struct Cli {
 const AFTER_HELP: &str = "Directive, inside .worktreeinclude:
   # worktreepg: .env DATABASE_URL
   # worktreepg: apps/api/.env DATABASE_URL DIRECT_URL
+  # worktreepg: .env DATABASE_URL share=shop   (share the fork with other repositories naming shop)
 
 Exit codes: 0 success, 1 internal error, 2 usage error, 3 conflict, 4 environment error.";
 
@@ -50,7 +51,7 @@ enum Command {
         /// Name to derive the database name from (default: the branch, or the directory when detached)
         #[arg(long, value_name = "name")]
         worktree_name: Option<String>,
-        /// Drop the existing fork and clone it again from current data
+        /// Drop the existing fork and clone it again from current data (for every owner, when it is shared)
         #[arg(long)]
         recreate: bool,
         /// Close open connections to the live database and clone it, rather than falling back to the template
@@ -62,7 +63,7 @@ enum Command {
         #[command(flatten)]
         common: Common,
     },
-    /// Remove a worktree (git worktree remove) and drop its forks
+    /// Remove a worktree (git worktree remove) and drop its forks, or release the ones it shares
     Remove {
         /// Worktree path (default: the current one)
         path: Option<String>,

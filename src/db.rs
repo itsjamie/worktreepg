@@ -3,13 +3,17 @@
 //!
 //! Every database worktreepg creates carries a `COMMENT ON DATABASE` of the form
 //! `worktreepg {json}` (see [`Meta`]). That comment is the only record of ownership, so
-//! nothing is ever dropped unless it carries one for the repository at hand.
+//! nothing is ever dropped unless it carries one for the repository at hand, and a fork shared
+//! by several repositories (see [`Ownership`]) only once it records nobody else. Every change
+//! to a fork, and the decision before it, is made holding that fork's advisory lock (see
+//! [`Admin::locked`]), because the comment is read and rewritten whole.
 //!
 //! Statements run over a connection to a maintenance database (`postgres`, then `template1`)
 //! using the credentials of the first env-file variable that named the database being worked on
 //! (see [`Pool`]). The development database itself is never held open here, so it stays usable
 //! as a `TEMPLATE`.
 
+use crate::directives::Share;
 use crate::errors::{annotated, conflict, conflict_as, environment, environment_as};
 use crate::pgurl::PgUrl;
 use crate::storage::{self, Sharing};
@@ -51,48 +55,117 @@ const NEEDS_SIGNAL: Refusal = Refusal {
         "Closing another role's connections needs membership in pg_signal_backend, or superuser; owning the database does not confer it. Stopping whatever is connected needs neither.",
 };
 
+/// One worktree a fork belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+pub struct Owner {
+    /// Canonical common `.git` directory of the repository.
+    pub repo: PathBuf,
+    /// Absolute path of the worktree, with symlinks resolved. Every path it is compared against
+    /// comes from `git::canonical`, which resolves them the same way, so the comparison is an
+    /// equality test and not a guess.
+    pub worktree: PathBuf,
+    pub branch: Option<String>,
+}
+
+/// Who a fork belongs to, and so who may drop it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ownership {
+    /// One worktree of one repository: every fork made before share groups, and every fork whose
+    /// directive names none. Written in format 1, which is what 0.4 and earlier read.
+    Sole(Owner),
+    /// Worktrees of repositories whose directives all name `group`, at most one per repository,
+    /// so two worktrees of one repository whose names collide are still refused rather than
+    /// sharing. The fork is dropped only once the last of them lets go of it.
+    Shared { group: String, owners: Vec<Owner> },
+}
+
+impl Ownership {
+    /// The ownership a new fork starts with: `owner`, alone, under the directive's group if any.
+    pub fn new(owner: Owner, share: &Share) -> Self {
+        match share {
+            Share::Private => Ownership::Sole(owner),
+            Share::Group(group) => Ownership::Shared { group: group.clone(), owners: vec![owner] },
+        }
+    }
+
+    pub fn owners(&self) -> &[Owner] {
+        match self {
+            Ownership::Sole(owner) => std::slice::from_ref(owner),
+            Ownership::Shared { owners, .. } => owners,
+        }
+    }
+
+    pub fn group(&self) -> Option<&str> {
+        match self {
+            Ownership::Sole(_) => None,
+            Ownership::Shared { group, .. } => Some(group),
+        }
+    }
+
+    /// This repository's owner, of which there is at most one.
+    pub fn of(&self, repo: &Path) -> Option<&Owner> {
+        self.owners().iter().find(|o| o.repo == repo)
+    }
+
+    /// The owners other than `worktree` of `repo`.
+    pub fn others(&self, repo: &Path, worktree: &Path) -> Vec<Owner> {
+        self.owners().iter().filter(|o| !(o.repo == repo && o.worktree == worktree)).cloned().collect()
+    }
+
+    /// What is left once `worktree` of `repo` lets go, or `None` when nobody is.
+    fn without(&self, repo: &Path, worktree: &Path) -> Option<Ownership> {
+        let owners = self.others(repo, worktree);
+        match self {
+            _ if owners.is_empty() => None,
+            Ownership::Sole(_) => Some(Ownership::Sole(owners.into_iter().next().expect("not empty"))),
+            Ownership::Shared { group, .. } => Some(Ownership::Shared { group: group.clone(), owners }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Meta {
-    #[serde(rename_all = "camelCase")]
     Fork {
-        v: u8,
-        /// Canonical common `.git` directory of the repository.
-        repo: PathBuf,
         /// The live development database everything descends from.
         source: String,
         /// What the fork was copied from: `source` when nothing was connected to it, else the template.
         template: String,
-        /// Absolute path of the worktree the fork was made for, with symlinks resolved. Every path
-        /// it is compared against comes from `git::canonical`, which resolves them the same way,
-        /// so the comparison is an equality test and not a guess.
-        worktree: PathBuf,
-        branch: Option<String>,
+        ownership: Ownership,
         created_at: String,
     },
+    Template {
+        repo: PathBuf,
+        source: String,
+        created_at: String,
+    },
+}
+
+/// Format 1 of the comment: what 0.4 and earlier write and read, and what a fork with one owner
+/// is still written as, so a repository that never names a share group can go back a version.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum V1 {
+    #[serde(rename_all = "camelCase")]
+    Fork { v: u8, repo: PathBuf, source: String, template: String, worktree: PathBuf, branch: Option<String>, created_at: String },
     #[serde(rename_all = "camelCase")]
     Template { v: u8, repo: PathBuf, source: String, created_at: String },
 }
 
-impl Meta {
-    pub fn repo(&self) -> &Path {
-        match self {
-            Meta::Fork { repo, .. } | Meta::Template { repo, .. } => repo,
-        }
-    }
+/// Format 2: a shared fork. It is a version of its own rather than extra fields on format 1
+/// because 0.4 ignores fields it does not know: it would read the first owner as the only one,
+/// and `remove` there would drop a fork other worktrees still use. 0.4 takes a comment of any
+/// other version for one that is not its own, which it never adopts or drops.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum V2 {
+    #[serde(rename_all = "camelCase")]
+    Fork { v: u8, source: String, template: String, share: String, owners: Vec<Owner>, created_at: String },
+}
 
+impl Meta {
     pub fn source(&self) -> &str {
         match self {
             Meta::Fork { source, .. } | Meta::Template { source, .. } => source,
-        }
-    }
-
-    /// The worktree a fork was made for. A template belongs to the repository rather than to any
-    /// one worktree, so it has none.
-    pub fn worktree(&self) -> Option<&Path> {
-        match self {
-            Meta::Fork { worktree, .. } => Some(worktree),
-            Meta::Template { .. } => None,
         }
     }
 
@@ -102,20 +175,50 @@ impl Meta {
         }
     }
 
+    /// Whether `repo` made this template, or owns a share in this fork.
+    pub fn belongs_to(&self, repo: &Path) -> bool {
+        match self {
+            Meta::Fork { ownership, .. } => ownership.of(repo).is_some(),
+            Meta::Template { repo: made_by, .. } => made_by == repo,
+        }
+    }
+
     fn is_template_for(&self, expected_repo: &Path, expected_source: &str) -> bool {
         matches!(self, Meta::Template { repo, source, .. } if repo == expected_repo && source == expected_source)
     }
 
     pub fn encode(&self) -> String {
-        format!("{META_PREFIX}{}", serde_json::to_string(self).expect("meta serializes"))
+        let json = match self.clone() {
+            Meta::Fork { source, template, ownership: Ownership::Sole(Owner { repo, worktree, branch }), created_at } => {
+                serde_json::to_string(&V1::Fork { v: 1, repo, source, template, worktree, branch, created_at })
+            }
+            Meta::Fork { source, template, ownership: Ownership::Shared { group, owners }, created_at } => {
+                serde_json::to_string(&V2::Fork { v: 2, source, template, share: group, owners, created_at })
+            }
+            Meta::Template { repo, source, created_at } => serde_json::to_string(&V1::Template { v: 1, repo, source, created_at }),
+        };
+        format!("{META_PREFIX}{}", json.expect("meta serializes"))
     }
 
-    /// `None` for comments that are not ours, including a future format version.
+    /// `None` for comments that are not ours, including a future format version, and a shared
+    /// fork nobody owns, which is not a state worktreepg leaves behind: the last owner drops it.
     pub fn decode(comment: &str) -> Option<Self> {
         let json = comment.strip_prefix(META_PREFIX)?;
-        let meta: Meta = serde_json::from_str(json).ok()?;
-        match meta {
-            Meta::Fork { v: 1, .. } | Meta::Template { v: 1, .. } => Some(meta),
+        let version = serde_json::from_str::<serde_json::Value>(json).ok()?.get("v")?.as_u64()?;
+        match version {
+            1 => match serde_json::from_str(json).ok()? {
+                V1::Fork { v: 1, repo, source, template, worktree, branch, created_at } => {
+                    Some(Meta::Fork { source, template, ownership: Ownership::Sole(Owner { repo, worktree, branch }), created_at })
+                }
+                V1::Template { v: 1, repo, source, created_at } => Some(Meta::Template { repo, source, created_at }),
+                _ => None,
+            },
+            2 => match serde_json::from_str(json).ok()? {
+                V2::Fork { v: 2, source, template, share, owners, created_at } if !owners.is_empty() => {
+                    Some(Meta::Fork { source, template, ownership: Ownership::Shared { group: share, owners }, created_at })
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -184,11 +287,15 @@ pub struct ForkSpec {
     pub repo: PathBuf,
     pub worktree: PathBuf,
     pub branch: Option<String>,
+    /// The `share=` group of the directives naming `source`, if any of them names one.
+    pub share: Share,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ForkOptions {
-    /// Drop and re-clone a fork that already exists.
+    /// Drop and re-clone a fork that already exists. A shared fork is re-cloned for every worktree
+    /// that owns it, and keeps them all as owners: they asked for one database, and refusing would
+    /// leave no way to refresh it short of every one of them letting go.
     pub recreate: bool,
     /// Close connections to the live database so it can be cloned while the app is running,
     /// instead of falling back to the template.
@@ -198,13 +305,160 @@ pub struct ForkOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForkStatus {
-    /// The fork was cloned, or in a dry run would be.
+    /// The fork was cloned, or in a dry run would be. `shared_with` are the other worktrees that
+    /// own it, which a `--recreate` of a shared fork replaced the data of too.
     Forked {
         from: String,
         copy: CopyMethod,
         origin: Origin,
+        shared_with: Vec<Owner>,
+    },
+    /// Another repository's worktree made the fork under the group this directive names, and this
+    /// worktree now owns it alongside `shared_with`, or in a dry run would.
+    Joined {
+        group: String,
+        shared_with: Vec<Owner>,
     },
     Exists,
+}
+
+/// What a run may do with a fork that already exists, decided from its recorded ownership and
+/// the directive alone (see [`admit`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Admission {
+    /// This worktree owns the fork already, on the terms its directive asks for.
+    Owned,
+    /// This worktree is the fork's only owner and its directive now asks for other terms, a group
+    /// added, changed, or taken away. It may set them alone, since nobody else holds a share to
+    /// lose; this is how a fork made before its repository named a group comes to be joinable.
+    Regroup(Ownership),
+    /// The fork is shared under the group this directive names, no worktree of this repository
+    /// holds it, and this one joins.
+    Join(Ownership),
+}
+
+/// What letting go of a fork came to (see [`Admin::release_fork`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Release {
+    /// Nobody else owned it, so it was dropped.
+    Dropped,
+    /// Other worktrees still own it, so it was kept with `remaining` as its owners.
+    Kept { remaining: Vec<Owner> },
+    /// The fork was gone, or no longer recorded this worktree, by the time the lock was held:
+    /// another run let go of it first.
+    Untouched,
+}
+
+impl Release {
+    /// What a dry run predicts from the metadata its scan read, which a real run reads again
+    /// under the lock and can find changed.
+    pub fn planned(meta: &Meta, repo: &Path, worktree: &Path) -> Self {
+        let Meta::Fork { ownership, .. } = meta else { return Release::Untouched };
+        if !ownership.owners().iter().any(|o| o.repo == repo && o.worktree == worktree) {
+            return Release::Untouched;
+        }
+        match ownership.without(repo, worktree) {
+            None => Release::Dropped,
+            Some(rest) => Release::Kept { remaining: rest.owners().to_vec() },
+        }
+    }
+}
+
+/// The worktrees in `owners`, for a message.
+fn worktrees(owners: &[Owner]) -> String {
+    owners.iter().map(|o| o.worktree.display().to_string()).collect::<Vec<_>>().join(", ")
+}
+
+/// Whether `me` may have the fork `name`, owned as `ownership`, on the terms `share` asks for. The
+/// refusals keep what 0.4 refused: a fork of another repository, or of another worktree of this
+/// one, is never taken over. A group only widens the first, and only to a directive naming the
+/// group the fork was made under. Two worktrees of one repository are refused even within a
+/// group, because a group is about repositories pointing at one database, and two of one
+/// repository's worktrees colliding on a name is the accident the refusal has always caught.
+fn admit(name: &str, ownership: &Ownership, me: &Owner, share: &Share) -> Result<Admission> {
+    let mine = ownership.of(&me.repo);
+    if let Some(owner) = mine.filter(|o| o.worktree != me.worktree) {
+        return Err(conflict_as(
+            "other_worktree",
+            vec![("worktree", json!(owner.worktree))],
+            format!(
+                "\"{name}\" is the fork for worktree {}, not {}. If that worktree moved here, moving it back keeps the fork and its data. \"git worktreepg prune\" clears a record whose worktree is gone, but drops the fork and its data with it, and the next apply makes a fresh one. If both worktrees are live, their names produce the same database name: rename one, or pass --worktree-name.",
+                owner.worktree.display(),
+                me.worktree.display()
+            ),
+        ));
+    }
+    let others = ownership.others(&me.repo, &me.worktree);
+    let (have, want) = (ownership.group(), share.group());
+    let other_group = |have: &str, want: &str| {
+        conflict_as(
+            "other_group",
+            vec![("share", json!(have)), ("owners", json!(others))],
+            format!(
+                "\"{name}\" is shared by {} under share={have}, not share={want}. Directives share a fork only under one group name: make them agree, or pass --worktree-name to fork under another name.",
+                worktrees(&others)
+            ),
+        )
+    };
+    match (mine, have, want) {
+        (Some(_), _, _) if have == want => Ok(Admission::Owned),
+        (Some(_), _, _) if others.is_empty() => Ok(Admission::Regroup(Ownership::new(me.clone(), share))),
+        (Some(_), Some(have), None) => Err(conflict_as(
+            "shared",
+            vec![("share", json!(have)), ("owners", json!(others))],
+            format!(
+                "\"{name}\" is shared with {} under share={have}, and this directive no longer names that group. A worktree cannot take a fork private while others still use it: put share={have} back, or pass --worktree-name to fork under another name.",
+                worktrees(&others)
+            ),
+        )),
+        (None, Some(have), Some(want)) if have == want => {
+            let mut owners = ownership.owners().to_vec();
+            owners.push(me.clone());
+            Ok(Admission::Join(Ownership::Shared { group: have.to_string(), owners }))
+        }
+        (_, Some(have), Some(want)) => Err(other_group(have, want)),
+        (None, Some(have), None) => Err(conflict_as(
+            "unmanaged",
+            vec![("share", json!(have)), ("owners", json!(others))],
+            format!(
+                "\"{name}\" is shared by {} under share={have}, and this directive names no share group. Add share={have} to it to join, or pass --worktree-name to fork under another name.",
+                worktrees(&others)
+            ),
+        )),
+        // Only a fork of another repository is left: one of this repository's is in a group or
+        // alone, and both of those were settled above.
+        (_, None, _) => {
+            let owner = &ownership.owners()[0];
+            let remedy = match want {
+                None => "Two repositories share a fork only when the directive in each names the same share=<group>; otherwise pass --worktree-name to fork under another name.".to_string(),
+                Some(want) => format!(
+                    "Its directive names no share group: add share={want} to it and re-run apply in {}, then re-run this one; or pass --worktree-name to fork under another name.",
+                    owner.worktree.display()
+                ),
+            };
+            Err(conflict_as(
+                "unmanaged",
+                vec![("repo", json!(owner.repo)), ("worktree", json!(owner.worktree))],
+                format!(
+                    "\"{name}\" is the fork for worktree {} of another repository ({}). {remedy}",
+                    owner.worktree.display(),
+                    owner.repo.display()
+                ),
+            ))
+        }
+    }
+}
+
+/// Advisory-lock namespace for fork names, the first key of `pg_advisory_lock(int, int)`: "wtpg".
+const LOCK_NAMESPACE: i32 = 0x7774_7067;
+
+/// The `pg_advisory_lock(int, int)` keys a run holds while it works on the fork `name`, for
+/// anything that needs to wait for worktreepg, or hold it off: the namespace, and 32-bit FNV-1a of
+/// the name, computed here rather than with the server's undocumented `hashtext` so every build
+/// agrees on it. Two names that collide only make their runs take turns.
+pub fn fork_lock(name: &str) -> (i32, i32) {
+    let hash = name.bytes().fold(0x811c_9dc5_u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+    (LOCK_NAMESPACE, i32::from_ne_bytes(hash.to_ne_bytes()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -550,26 +804,42 @@ impl Admin {
         Ok(rows.iter().filter_map(|r| Meta::decode(r.get::<_, String>(1).as_str()).map(|meta| Managed { name: r.get(0), meta })).collect())
     }
 
+    /// The forks a worktree of `repo` owns, alone or with other repositories.
     pub fn forks_for(&mut self, repo: &Path) -> Result<Vec<Managed>> {
-        Ok(self.list_managed()?.into_iter().filter(|m| matches!(m.meta, Meta::Fork { .. }) && m.meta.repo() == repo).collect())
+        Ok(self.list_managed()?.into_iter().filter(|m| matches!(m.meta, Meta::Fork { .. }) && m.meta.belongs_to(repo)).collect())
     }
 
-    /// Makes sure `spec.name` exists as a fork of `spec.source`. The fork is cloned from the live
-    /// database when nothing else is connected to it, and from the template otherwise, because
-    /// Postgres refuses to copy a database that is in use. A fork cloned from the live database
-    /// also replaces the template, when there is one, with a copy of itself, so the fallback is
-    /// as current as the last fork. Re-running is a no-op. A database of that name that
-    /// worktreepg did not create for this repository, or that records a different worktree, is a
-    /// conflict, with or without `recreate`: the recorded worktree may be a live one whose name
-    /// normalizes to the same fork name, and recreating then drops its data. With `recreate` the
-    /// existing fork is dropped only once the source looks copyable, so a run that cannot make
-    /// the replacement keeps the fork it had.
+    /// Makes sure `spec.name` exists as a fork of `spec.source` that this worktree owns. The fork
+    /// is cloned from the live database when nothing else is connected to it, and from the
+    /// template otherwise, because Postgres refuses to copy a database that is in use. A fork
+    /// cloned from the live database also replaces the template, when there is one, with a copy of
+    /// itself, so the fallback is as current as the last fork. Re-running is a no-op. A fork that
+    /// exists already is joined, re-grouped, or refused as [`admit`] decides, with or without
+    /// `recreate`: the recorded worktree may be a live one whose name normalizes to the same fork
+    /// name, and recreating then drops its data. With `recreate` the existing fork is dropped only
+    /// once the source looks copyable, so a run that cannot make the replacement keeps the fork it
+    /// had.
+    ///
+    /// Everything but a dry run holds the fork's advisory lock throughout (see [`Admin::locked`]),
+    /// so two runs that want one fork take turns: the second waits for the first's clone and its
+    /// comment, then finds a fork it can join rather than racing it to `CREATE DATABASE` or
+    /// reading a fork with no comment yet as one worktreepg did not make.
     pub fn ensure_fork(&mut self, spec: &ForkSpec, opts: ForkOptions) -> Result<ForkStatus> {
+        if opts.dry_run {
+            return self.settle_fork(spec, opts);
+        }
+        self.locked(&spec.name, |admin| admin.settle_fork(spec, opts))
+    }
+
+    fn settle_fork(&mut self, spec: &ForkSpec, opts: ForkOptions) -> Result<ForkStatus> {
         // Read before the fork is dropped below, because whether there is a snapshot to clone
         // from is what decides whether dropping it can be made good.
         let template = self.template_of(&spec.source, &spec.repo)?;
+        let me = Owner { repo: spec.repo.clone(), worktree: spec.worktree.clone(), branch: spec.branch.clone() };
+        let mut ownership = Ownership::new(me.clone(), &spec.share);
         if self.exists(&spec.name)? {
-            match self.meta(&spec.name)? {
+            let (source, copied_from, existing, created_at) = match self.meta(&spec.name)? {
+                Some(Meta::Fork { source, template, ownership, created_at }) => (source, template, ownership, created_at),
                 Some(Meta::Template { .. }) => {
                     return Err(conflict_as(
                         "template",
@@ -577,39 +847,40 @@ impl Admin {
                         format!("\"{}\" is a worktreepg template database, not a fork", spec.name),
                     ))
                 }
-                // The recorded path is only compared here, never followed, so a worktree that has
-                // moved or been removed is indistinguishable from a second live worktree whose
-                // name normalizes the same way. The message names the remedy for each, and what
-                // prune costs: it drops the fork rather than re-pointing it at the new path.
-                Some(Meta::Fork { ref repo, ref source, ref worktree, .. }) if repo == &spec.repo => {
-                    if source != &spec.source {
-                        return Err(conflict_as(
-                            "other_source",
-                            vec![("source", json!(source))],
-                            format!(
-                                "\"{}\" is a fork of database \"{source}\", not \"{}\"; rename one source database or pass --worktree-name",
-                                spec.name, spec.source
-                            ),
-                        ));
-                    }
-                    if worktree != &spec.worktree {
-                        return Err(conflict_as(
-                            "other_worktree",
-                            vec![("worktree", json!(worktree))],
-                            format!(
-                                "\"{}\" is the fork for worktree {}, not {}. If that worktree moved here, moving it back keeps the fork and its data. \"git worktreepg prune\" clears a record whose worktree is gone, but drops the fork and its data with it, and the next apply makes a fresh one. If both worktrees are live, their names produce the same database name: rename one, or pass --worktree-name.",
-                                spec.name,
-                                worktree.display(),
-                                spec.worktree.display()
-                            ),
-                        ));
-                    }
-                }
-                _ => return Err(conflict("database already exists and was not created by worktreepg for this repository")),
+                None => return Err(conflict("database already exists and was not created by worktreepg for this repository")),
+            };
+            // The source is compared only where this repository has a say in the fork, so a fork
+            // of another repository's is refused as that rather than as a different database.
+            let involved = existing.of(&spec.repo).is_some() || (existing.group().is_some() && existing.group() == spec.share.group());
+            if involved && source != spec.source {
+                return Err(conflict_as(
+                    "other_source",
+                    vec![("source", json!(source))],
+                    format!(
+                        "\"{}\" is a fork of database \"{source}\", not \"{}\"; rename one source database or pass --worktree-name",
+                        spec.name, spec.source
+                    ),
+                ));
             }
+            let admission = admit(&spec.name, &existing, &me, &spec.share)?;
             if !opts.recreate {
-                return Ok(ForkStatus::Exists);
+                let status = match &admission {
+                    Admission::Owned => return Ok(ForkStatus::Exists),
+                    Admission::Regroup(_) => ForkStatus::Exists,
+                    Admission::Join(next) => ForkStatus::Joined {
+                        group: next.group().expect("a joined fork is shared").to_string(),
+                        shared_with: existing.owners().to_vec(),
+                    },
+                };
+                if let (Admission::Regroup(next) | Admission::Join(next), false) = (admission, opts.dry_run) {
+                    self.set_meta(&spec.name, &Meta::Fork { source, template: copied_from, ownership: next, created_at })?;
+                }
+                return Ok(status);
             }
+            ownership = match admission {
+                Admission::Owned => existing,
+                Admission::Regroup(next) | Admission::Join(next) => next,
+            };
             if !opts.dry_run {
                 // The fork is only dropped once the source looks copyable, the way a template
                 // refresh keeps the snapshot it had: with nothing to fall back on, a --recreate
@@ -627,6 +898,7 @@ impl Admin {
                 self.drop_database(&spec.name)?;
             }
         }
+        let shared_with = ownership.others(&spec.repo, &spec.worktree);
 
         let copy = self.copy;
         let fallback = |template: Option<ExistingTemplate>, attached: Attached, basis: Basis, signals: Signals| match template {
@@ -654,7 +926,7 @@ impl Admin {
             } else {
                 fallback(template, attached, Basis::Predicted, Signals::Accepted)?
             };
-            return Ok(ForkStatus::Forked { from, copy, origin });
+            return Ok(ForkStatus::Forked { from, copy, origin, shared_with });
         }
 
         let (from, origin) = match self.create_from(&spec.name, &spec.source, opts.terminate)? {
@@ -667,18 +939,7 @@ impl Admin {
                 (from, origin)
             }
         };
-        self.set_meta(
-            &spec.name,
-            &Meta::Fork {
-                v: 1,
-                repo: spec.repo.clone(),
-                source: spec.source.clone(),
-                template: from.clone(),
-                worktree: spec.worktree.clone(),
-                branch: spec.branch.clone(),
-                created_at: now(),
-            },
-        )?;
+        self.set_meta(&spec.name, &Meta::Fork { source: spec.source.clone(), template: from.clone(), ownership, created_at: now() })?;
         if let Origin::Live { template_refreshed: true } = origin {
             // Copied from the fork rather than the live database: the fork has no connections yet,
             // so this cannot fail the way a second copy of the live database could if the app
@@ -687,7 +948,54 @@ impl Admin {
             self.drop_database(&name)?;
             self.create_template(&name, &spec.name, &spec.source, &spec.repo, false)?;
         }
-        Ok(ForkStatus::Forked { from, copy, origin })
+        Ok(ForkStatus::Forked { from, copy, origin, shared_with })
+    }
+
+    /// Lets go of `worktree`'s share in the fork `name`: drops the fork when that leaves nobody,
+    /// and otherwise rewrites its comment without the worktree, so a `remove` or `prune` in one
+    /// repository never drops a fork a worktree of another still uses. The metadata is read
+    /// again under the fork's lock rather than trusted from the scan that found it, because a
+    /// worktree of another repository may have joined since; a join that waits on this lock and
+    /// finds the fork gone makes a new one. Callers pass names from [`Admin::forks_for`]; whether
+    /// this connection's role owns the fork is a separate question, and the only answer to it is
+    /// the server's, which comes as a refusal carrying [`NOT_OWNER`], from the drop and the
+    /// comment alike.
+    pub fn release_fork(&mut self, name: &str, repo: &Path, worktree: &Path) -> Result<Release> {
+        self.locked(name, |admin| {
+            let Some(meta) = admin.meta(name)? else { return Ok(Release::Untouched) };
+            let release = Release::planned(&meta, repo, worktree);
+            let Meta::Fork { source, template, ownership, created_at } = meta else { return Ok(release) };
+            match ownership.without(repo, worktree) {
+                _ if release == Release::Untouched => {}
+                None => admin.drop_database(name)?,
+                Some(rest) => admin.set_meta(name, &Meta::Fork { source, template, ownership: rest, created_at })?,
+            }
+            Ok(release)
+        })
+    }
+
+    /// Runs `work` holding the session-level advisory lock for the fork `name`, which every run
+    /// that creates, joins, recreates, lets go of, or drops a fork takes first. The lock is what
+    /// keeps the decision and the act together: ownership is a comment, read and rewritten
+    /// whole, so two runs interleaving between the read and the write would lose one of their
+    /// owners, or drop a fork the other had just joined. A transaction cannot do this, because
+    /// `CREATE DATABASE` and `DROP DATABASE` refuse to run inside one, so it is a session lock,
+    /// released when `work` returns and in any case when the connection closes.
+    ///
+    /// Advisory locks belong to the database the session is connected to. Every admin connection
+    /// is to `postgres`, or to `template1` on a cluster without it (see [`Admin::connect`]), so
+    /// every run on one cluster meets in the same place; one role that cannot connect to
+    /// `postgres` on a cluster where another can would not. The wait is unbounded, which is
+    /// what a run joining a fork still being cloned needs, and the one it waits on is a
+    /// worktreepg run that ends.
+    fn locked<T>(&mut self, name: &str, work: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let (namespace, key) = fork_lock(name);
+        self.client.execute("SELECT pg_advisory_lock($1, $2)", &[&namespace, &key])?;
+        let result = work(self);
+        // A failed unlock means the connection is gone, and the lock went with it: the work is
+        // done or failed on its own terms either way, so that is what is reported.
+        let _ = self.client.execute("SELECT pg_advisory_unlock($1, $2)", &[&namespace, &key]);
+        result
     }
 
     /// Snapshots `source` into its template database. The template is flagged `IS_TEMPLATE`, so
@@ -725,7 +1033,7 @@ impl Admin {
         if let CopyOutcome::InUse { attached, signals } = self.create_from(name, from, terminate)? {
             return Err(in_use(from, attached, Basis::Refused, signals));
         }
-        self.set_meta(name, &Meta::Template { v: 1, repo: repo.to_path_buf(), source: source.to_string(), created_at: now() })?;
+        self.set_meta(name, &Meta::Template { repo: repo.to_path_buf(), source: source.to_string(), created_at: now() })?;
         let sql = format!("ALTER DATABASE {} WITH IS_TEMPLATE true ALLOW_CONNECTIONS false", ident(name));
         self.run(&format!("flagging database {name} as a template"), &sql)?;
         Ok(())
@@ -774,30 +1082,25 @@ impl Admin {
         Ok(TemplateStatus::Dropped)
     }
 
-    /// Drops a fork. Callers pass names from [`Admin::forks_for`], so worktreepg made it for this
-    /// repository; whether this connection's role owns it is a separate question, and the only
-    /// answer to it is the server's, which comes as a refusal carrying [`NOT_OWNER`].
-    pub fn drop_fork(&mut self, name: &str, dry_run: bool) -> Result<()> {
-        if !dry_run {
-            self.drop_database(name)?;
-        }
-        Ok(())
-    }
-
     /// The refusal a drop of `name`, owned by `owner`, would meet here, for a dry run, which runs
-    /// no statement to be refused by. Ownership is the whole of what can be asked ahead of the
+    /// no statement to be refused by. Rewriting its comment asks for the same ownership, so this
+    /// is also the refusal a release that keeps the fork would meet. Ownership is the whole of what can be asked ahead of the
     /// drop, and `pg_has_role` is the check the drop itself makes, so this is the server's answer
     /// rather than a guess from the role names: a superuser and a member of `owner` both pass it.
     /// What is attached to the database is a question for the moment the drop runs, so `None` is
     /// not a promise that it will go through.
-    pub fn drop_refusal(&mut self, name: &str, owner: &str) -> Result<Option<anyhow::Error>> {
+    pub fn drop_refusal(&mut self, name: &str, owner: &str, release: &Release) -> Result<Option<anyhow::Error>> {
         if self.owns(name)? {
             return Ok(None);
         }
+        let action = match release {
+            Release::Kept { .. } => "commenting on",
+            Release::Dropped | Release::Untouched => "dropping",
+        };
         Ok(Some(environment_as(
             NOT_OWNER,
             vec![("role", json!(self.role))],
-            format!("dropping database {name}{} on {}: \"{owner}\" owns it, so Postgres will refuse it.", as_role(&self.role), self.server),
+            format!("{action} database {name}{} on {}: \"{owner}\" owns it, so Postgres will refuse it.", as_role(&self.role), self.server),
         )))
     }
 
@@ -1069,36 +1372,152 @@ mod tests {
         assert!(template_name(&unicode_source).len() <= 63);
     }
 
+    fn owner(repo: &str, worktree: &str) -> Owner {
+        Owner { repo: repo.into(), worktree: worktree.into(), branch: Some("w1".into()) }
+    }
+
+    fn fork(ownership: Ownership) -> Meta {
+        Meta::Fork { source: "app".into(), template: "app".into(), ownership, created_at: "2026-08-22T00:00:00.000Z".into() }
+    }
+
+    fn shared(group: &str, owners: Vec<Owner>) -> Ownership {
+        Ownership::Shared { group: group.into(), owners }
+    }
+
     #[test]
     fn meta_round_trips_through_a_comment() {
-        let meta = Meta::Fork {
-            v: 1,
-            repo: "/r/.git".into(),
-            source: "app".into(),
-            template: "app_template".into(),
-            worktree: "/r-wt".into(),
-            branch: Some("x".into()),
-            created_at: "2026-08-22T00:00:00.000Z".into(),
-        };
+        let meta = fork(Ownership::Sole(owner("/r/.git", "/r-wt")));
         let comment = meta.encode();
-        assert!(comment.starts_with("worktreepg {\"kind\":\"fork\""));
+        assert!(comment.starts_with("worktreepg {\"kind\":\"fork\",\"v\":1"));
         assert!(comment.contains("\"createdAt\""));
         assert_eq!(Meta::decode(&comment), Some(meta));
+
+        let meta = fork(shared("shop", vec![owner("/api/.git", "/api-w1"), owner("/web/.git", "/web-w1")]));
+        let comment = meta.encode();
+        assert!(comment.starts_with("worktreepg {\"kind\":\"fork\",\"v\":2"), "{comment}");
+        assert_eq!(Meta::decode(&comment), Some(meta));
+    }
+
+    /// The exact comment 0.4 writes, so a fork made before share groups is read as the sole
+    /// worktree's, and a fork with one owner is still written the way 0.4 reads it.
+    #[test]
+    fn a_comment_written_by_0_4_reads_as_a_sole_owner_and_is_written_back_unchanged() {
+        let comment = "worktreepg {\"kind\":\"fork\",\"v\":1,\"repo\":\"/r/.git\",\"source\":\"app\",\"template\":\"app_template\",\"worktree\":\"/r-wt\",\"branch\":\"feature/x\",\"createdAt\":\"2026-08-22T00:00:00.000Z\"}";
+        let meta = Meta::decode(comment).expect("0.4 comment");
+        let Meta::Fork { ref ownership, ref template, .. } = meta else { panic!("{meta:?}") };
+        assert_eq!(template, "app_template");
+        assert_eq!(
+            ownership,
+            &Ownership::Sole(Owner { repo: "/r/.git".into(), worktree: "/r-wt".into(), branch: Some("feature/x".into()) })
+        );
+        assert_eq!(meta.encode(), comment);
+
+        let template =
+            "worktreepg {\"kind\":\"template\",\"v\":1,\"repo\":\"/r/.git\",\"source\":\"app\",\"createdAt\":\"2026-08-22T00:00:00.000Z\"}";
+        assert_eq!(Meta::decode(template).expect("0.4 template").encode(), template);
+    }
+
+    /// What 0.4 makes of a shared fork's comment, by the rule it decodes with: a format 1 fork
+    /// needs `repo` and `worktree`, which format 2 does not carry, so 0.4 sees a database that is
+    /// not its own and neither adopts nor drops it.
+    #[test]
+    fn a_shared_fork_is_unreadable_to_0_4() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        #[serde(tag = "kind", rename_all = "lowercase")]
+        enum Meta04 {
+            #[serde(rename_all = "camelCase")]
+            Fork { v: u8, repo: PathBuf, source: String, template: String, worktree: PathBuf, branch: Option<String>, created_at: String },
+        }
+        let comment = fork(shared("shop", vec![owner("/api/.git", "/api-w1")])).encode();
+        assert!(serde_json::from_str::<Meta04>(comment.strip_prefix(META_PREFIX).unwrap()).is_err(), "{comment}");
     }
 
     #[test]
     fn meta_ignores_foreign_comments() {
         assert_eq!(Meta::decode("production database"), None);
         assert_eq!(Meta::decode("worktreepg not json"), None);
+        assert_eq!(Meta::decode("worktreepg {\"kind\":\"fork\",\"v\":3,\"repo\":\"/\",\"source\":\"a\",\"template\":\"a\",\"worktree\":\"/\",\"branch\":null,\"createdAt\":\"\"}"), None);
+        // a version that does not match its shape, and a shared fork nobody owns
         assert_eq!(Meta::decode("worktreepg {\"kind\":\"fork\",\"v\":2,\"repo\":\"/\",\"source\":\"a\",\"template\":\"a\",\"worktree\":\"/\",\"branch\":null,\"createdAt\":\"\"}"), None);
+        assert_eq!(Meta::decode("worktreepg {\"kind\":\"fork\",\"v\":2,\"source\":\"a\",\"template\":\"a\",\"share\":\"s\",\"owners\":[],\"createdAt\":\"\"}"), None);
+        assert_eq!(Meta::decode("worktreepg {\"kind\":\"template\",\"v\":2,\"repo\":\"/\",\"source\":\"a\",\"createdAt\":\"\"}"), None);
     }
 
     #[test]
     fn template_identity_includes_its_repository_and_source() {
-        let meta = Meta::Template { v: 1, repo: "/one/.git".into(), source: "app".into(), created_at: String::new() };
+        let meta = Meta::Template { repo: "/one/.git".into(), source: "app".into(), created_at: String::new() };
         assert!(meta.is_template_for(Path::new("/one/.git"), "app"));
         assert!(!meta.is_template_for(Path::new("/two/.git"), "app"));
         assert!(!meta.is_template_for(Path::new("/one/.git"), "other"));
+    }
+
+    fn status_of(result: Result<Admission>) -> &'static str {
+        let err = result.expect_err("a conflict");
+        crate::errors::detail_of(&err).expect("a detailed conflict").status
+    }
+
+    #[test]
+    fn a_fork_is_joined_only_by_a_directive_naming_its_group() {
+        let (api, web) = (owner("/api/.git", "/api-w1"), owner("/web/.git", "/web-w1"));
+        let shop = Share::Group("shop".into());
+        let ownership = shared("shop", vec![api.clone()]);
+        assert_eq!(admit("app_w1", &ownership, &web, &shop).unwrap(), Admission::Join(shared("shop", vec![api.clone(), web.clone()])));
+        assert_eq!(admit("app_w1", &ownership, &api, &shop).unwrap(), Admission::Owned);
+        assert_eq!(status_of(admit("app_w1", &ownership, &web, &Share::Private)), "unmanaged");
+        assert_eq!(status_of(admit("app_w1", &ownership, &web, &Share::Group("other".into()))), "other_group");
+    }
+
+    #[test]
+    fn a_fork_made_without_a_group_is_never_joined() {
+        let (api, web) = (owner("/api/.git", "/api-w1"), owner("/web/.git", "/web-w1"));
+        let sole = Ownership::Sole(api.clone());
+        assert_eq!(status_of(admit("app_w1", &sole, &web, &Share::Private)), "unmanaged");
+        assert_eq!(status_of(admit("app_w1", &sole, &web, &Share::Group("shop".into()))), "unmanaged");
+        assert_eq!(admit("app_w1", &sole, &api, &Share::Private).unwrap(), Admission::Owned);
+    }
+
+    #[test]
+    fn two_worktrees_of_one_repository_are_refused_even_within_a_group() {
+        let shop = Share::Group("shop".into());
+        let ownership = shared("shop", vec![owner("/api/.git", "/api-w1"), owner("/web/.git", "/web-w1")]);
+        assert_eq!(status_of(admit("app_w1", &ownership, &owner("/api/.git", "/api-other"), &shop)), "other_worktree");
+    }
+
+    #[test]
+    fn a_sole_owner_sets_the_terms_alone_and_a_shared_one_cannot() {
+        let (api, web) = (owner("/api/.git", "/api-w1"), owner("/web/.git", "/web-w1"));
+        let shop = Share::Group("shop".into());
+        let sole = Ownership::Sole(api.clone());
+        assert_eq!(admit("app_w1", &sole, &api, &shop).unwrap(), Admission::Regroup(shared("shop", vec![api.clone()])));
+        assert_eq!(admit("app_w1", &shared("shop", vec![api.clone()]), &api, &Share::Private).unwrap(), Admission::Regroup(sole));
+
+        let both = shared("shop", vec![api.clone(), web.clone()]);
+        assert_eq!(status_of(admit("app_w1", &both, &api, &Share::Private)), "shared");
+        assert_eq!(status_of(admit("app_w1", &both, &api, &Share::Group("other".into()))), "other_group");
+    }
+
+    #[test]
+    fn a_fork_is_dropped_only_when_its_last_owner_lets_go() {
+        let (api, web) = (owner("/api/.git", "/api-w1"), owner("/web/.git", "/web-w1"));
+        let both = fork(shared("shop", vec![api.clone(), web.clone()]));
+        assert_eq!(Release::planned(&both, &api.repo, &api.worktree), Release::Kept { remaining: vec![web.clone()] });
+        assert_eq!(Release::planned(&fork(shared("shop", vec![web.clone()])), &web.repo, &web.worktree), Release::Dropped);
+        assert_eq!(Release::planned(&fork(Ownership::Sole(api.clone())), &api.repo, &api.worktree), Release::Dropped);
+        // a worktree the fork does not record has nothing to let go of
+        assert_eq!(Release::planned(&both, &api.repo, Path::new("/api-other")), Release::Untouched);
+        assert_eq!(
+            shared("shop", vec![api.clone(), web.clone()]).without(&api.repo, &api.worktree),
+            Some(shared("shop", vec![web.clone()])),
+            "the group outlives the owner that made it"
+        );
+    }
+
+    #[test]
+    fn fork_locks_are_stable_across_builds() {
+        assert_eq!(fork_lock(""), (0x7774_7067, 0x811c_9dc5_u32 as i32));
+        assert_eq!(fork_lock("app_w1"), fork_lock("app_w1"));
+        assert_ne!(fork_lock("app_w1"), fork_lock("app_w2"));
     }
 
     #[test]
